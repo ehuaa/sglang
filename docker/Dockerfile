@@ -1,6 +1,7 @@
 ARG CUDA_VERSION=12.5.1
 
-FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
+# use 24.02 to cope with tianqing cuda version 12.3.X
+FROM nvcr.io/nvidia/tritonserver:24.02-py3-min
 
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,20 +21,23 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
 # For openbmb/MiniCPM models
 RUN pip3 install datamodel_code_generator
 
 WORKDIR /sgl-workspace
 
 ARG CUDA_VERSION
+COPY . /sgl-workspace/sglang
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
-    && git clone --depth=1 https://github.com/sgl-project/sglang.git \
+    # && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124; \
        elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-         python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124; \
+         python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu118; \
          python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
@@ -60,7 +64,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
          elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
            python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/; \
          elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links ./flashinfer_python-0.2.0.post2+cu124torch2.5-cp310-cp310-linux_x86_64.whl; \
          elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
            python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer/; \
            python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
@@ -68,5 +72,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
            echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
          fi; \
        fi
+
+RUN rm -rf flashinfer_python-0.2.0.post2+cu124torch2.5-cp310-cp310-linux_x86_64.whl
 
 ENV DEBIAN_FRONTEND=interactive
