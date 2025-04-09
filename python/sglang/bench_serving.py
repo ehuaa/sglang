@@ -751,6 +751,7 @@ def sample_geogpt_requests(
             add_generation_prompt=True,
             tokenize=False,
         )
+        # for qwen comment replace bos_token, for deepseek uncomment
         prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)

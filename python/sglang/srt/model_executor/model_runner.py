@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -67,6 +68,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
+    set_cuda_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,8 +112,14 @@ class ModelRunner:
         ):
             # TODO: add MLA optimization on CPU
             if self.server_args.device != "cpu":
-                logger.info("MLA optimization is turned on. Use triton backend.")
-                self.server_args.attention_backend = "triton"
+                if server_args.enable_flashinfer_mla:
+                    logger.info(
+                        "MLA optimization is turned on. Use flashinfer mla backend."
+                    )
+                    self.server_args.attention_backend = "flashinfer_mla"
+                else:
+                    logger.info("MLA optimization is turned on. Use triton backend.")
+                    self.server_args.attention_backend = "triton"
 
         if self.server_args.enable_double_sparsity:
             logger.info(
@@ -169,6 +177,8 @@ class ModelRunner:
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "device": server_args.device,
+                "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
+                "disable_radix_cache": server_args.disable_radix_cache,
             }
         )
 
@@ -249,6 +259,7 @@ class ModelRunner:
                 rank=self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
+                timeout=self.server_args.dist_timeout,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
             initialize_dp_attention(
@@ -291,6 +302,8 @@ class ModelRunner:
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
+
+        set_cuda_arch()
 
         # Prepare the model config
         self.load_config = LoadConfig(
@@ -692,6 +705,8 @@ class ModelRunner:
                 self.attn_backend = TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
             self.attn_backend = TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer_mla":
+            self.attn_backend = FlashInferMLAAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
