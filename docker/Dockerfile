@@ -34,45 +34,19 @@ COPY . /sgl-workspace/sglang
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     # && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
-         python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu121; \
+         export CUINDEX=121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-         python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124; \
+         export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-         python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124; \
+         export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-         python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu118; \
-         python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
+         export CUINDEX=118; \
+         python3 -m pip install --no-cache-dir sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
        else \
          echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
        fi \
+    && python3 -m pip install --no-cache-dir torch==2.5.1 \
     && cd sglang \
-    && if [ "$BUILD_TYPE" = "srt" ]; then \
-         if [ "$CUDA_VERSION" = "12.1.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer-python; \
-         elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
-         elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
-         elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer-python; \
-           python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
-         else \
-           echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
-         fi; \
-       else \
-         if [ "$CUDA_VERSION" = "12.1.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer-python; \
-         elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
-         elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links ./flashinfer_python-0.2.2+cu124torch2.5-cp38-abi3-linux_x86_64.whl; \
-         elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer-python; \
-           python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
-         else \
-           echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
-         fi; \
-       fi
+    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://ghfast.top/https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.3/flashinfer_python-0.2.3%2Bcu124torch2.5-cp38-abi3-linux_x86_64.whl
 
-RUN rm -rf flashinfer_python-0.2.2+cu124torch2.5-cp38-abi3-linux_x86_64.whl
 ENV DEBIAN_FRONTEND=interactive

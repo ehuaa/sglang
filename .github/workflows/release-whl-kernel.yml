@@ -9,12 +9,12 @@ on:
     branches:
       - main
     paths:
-      - sgl-kernel/src/sgl-kernel/version.py
+      - sgl-kernel/python/sgl_kernel/version.py
 
 jobs:
   build-wheels:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ['3.9']
@@ -59,7 +59,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/src/sgl-kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
