@@ -45,8 +45,8 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
        else \
          echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
        fi \
-    && python3 -m pip install --no-cache-dir torch==2.5.1 \
+    && python3 -m pip install --no-cache-dir torch==2.6.0 \
     && cd sglang \
-    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://ghfast.top/https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.3/flashinfer_python-0.2.3%2Bcu124torch2.5-cp38-abi3-linux_x86_64.whl
-
+    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links flashinfer_python-0.2.3+cu124torch2.6-cp38-abi3-linux_x86_64.whl \
+    && python3 -m pip install sgl-kernel/dist/sgl_kernel-0.1.0-cp39-abi3-linux_x86_64.whl
 ENV DEBIAN_FRONTEND=interactive
