@@ -18,7 +18,8 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip3 install --upgrade pip
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
 
 # For openbmb/MiniCPM models
 RUN pip3 install datamodel_code_generator --break-system-packages
