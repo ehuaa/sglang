@@ -42,9 +42,11 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six --break-s
        else \
          echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
        fi \
-    && python3 -m pip install --no-cache-dir torch==2.7.1 --break-system-packages \
+    && python3 -m pip install --no-cache-dir torch==2.6.0 --break-system-packages \
     && cd sglang \
     && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --break-system-packages \
+    && python3 -m pip --no-cache-dir install sgl-kernel/dist/sgl_kernel-0.1.9-cp39-abi3-linux_x86_64.whl --break-system-packages --force-reinstall \
+    && python3 -m pip --no-cache-dir install flashinfer_python-0.2.5+cu124torch2.6-cp38-abi3-linux_x86_64.whl --break-system-packages \
     && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
          python3 -m pip install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps --break-system-packages; \
        fi
