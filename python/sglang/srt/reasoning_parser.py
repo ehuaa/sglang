@@ -90,7 +90,13 @@ class BaseReasoningFormatDetector:
         if self._in_reasoning:
             if self.stream_reasoning:
                 # Stream the content immediately
-                self._buffer = ""
+                # find the last '<' in self._buffer
+                special_token_pos = self._buffer.rfind('<')
+                # if found '<' in self._buffer, check if self.think_end_token is startwith self._buffer[found:]
+                if special_token_pos != -1 and self.think_end_token.startswith(self._buffer[special_token_pos:]):
+                    return StreamingParseResult()
+                else:
+                    self._buffer = ""
                 return StreamingParseResult(reasoning_text=current_text)
             else:
                 return StreamingParseResult()
