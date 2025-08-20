@@ -9,6 +9,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
@@ -320,6 +321,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
+        self.is_hybrid = model_runner.is_hybrid
+        if self.is_hybrid:
+            self.full_to_swa_index_mapping = (
+                model_runner.token_to_kv_pool.full_to_swa_index_mapping
+            )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
@@ -428,7 +434,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
             # TODO: we need to test this part for llama 4 eagle case
-            self._init_local_attn_metadata(metadata, device)
+            self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
@@ -456,7 +462,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
-                self._init_local_attn_metadata(metadata, device)
+                self._init_local_attn_metadata(forward_batch, metadata, device)
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
@@ -575,7 +581,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
-                self._init_local_attn_metadata(metadata, device)
+                self._init_local_attn_metadata(forward_batch, metadata, device)
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -1400,7 +1406,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     metadata.page_table = self.decode_cuda_graph_metadata[
                         "page_table_draft_decode"
-                    ][req_pool_indices, :]
+                    ][:bs, :]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -1418,7 +1424,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ][: bs + 1]
                     metadata.page_table = self.draft_decode_metadata_topk_normal[
                         "page_table"
-                    ][req_pool_indices, :]
+                    ][:bs, :]
 
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand.cache_seqlens_int32 = (
@@ -1455,7 +1461,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = seq_lens.max().item()
                 # Precompute page table
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
-                    req_pool_indices, :
+                    :bs, :
                 ]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
@@ -1492,9 +1498,7 @@ class FlashAttentionBackend(AttentionBackend):
                     : (bs + 1)
                 ]
 
-                metadata.page_table = self.target_verify_metadata["page_table"][
-                    req_pool_indices, :
-                ]
+                metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
                 self.target_verify_metadata[bs] = metadata
             else:
@@ -1513,7 +1517,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ][: bs + 1]
                 metadata.page_table = self.target_verify_metadata_topk_normal[
                     "page_table"
-                ][req_pool_indices, :]
+                ][:bs, :]
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand.cache_seqlens_int32 = (
@@ -1556,9 +1560,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
-            metadata.page_table = self.draft_extend_metadata["page_table"][
-                req_pool_indices, :
-            ]
+            metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
 
             self.draft_extend_metadata[bs] = metadata
 
@@ -1572,7 +1574,7 @@ class FlashAttentionBackend(AttentionBackend):
             ][: (encoder_bs + 1)]
 
             metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
-                req_pool_indices, :
+                :bs, :
             ]
 
         self.forward_metadata = metadata
@@ -1588,7 +1590,7 @@ class FlashAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: torch.Tensor = None,
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         seq_lens = seq_lens[:bs]
@@ -1611,7 +1613,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
 
-                    normal_decode_set_medadata(
+                    normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
                         metadata.page_table,
@@ -1660,7 +1662,7 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
-                normal_decode_set_medadata(
+                normal_decode_set_metadata(
                     metadata.cache_seqlens_int32,
                     metadata.cu_seqlens_k,
                     metadata.page_table,
@@ -1673,7 +1675,10 @@ class FlashAttentionBackend(AttentionBackend):
                     self.page_size,
                 )
 
-                self._update_local_attn_metadata_for_replay(metadata, bs)
+                self._update_local_attn_metadata_for_replay(
+                    metadata,
+                    bs,
+                )
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
@@ -1829,7 +1834,9 @@ class FlashAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
-    def _init_local_attn_metadata(self, metadata: FlashAttentionMetadata, device):
+    def _init_local_attn_metadata(
+        self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
+    ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
         if self.attention_chunk_size is None:
             metadata.local_attn_metadata = None
@@ -1837,7 +1844,12 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        page_table = metadata.page_table
+        if self.is_hybrid:
+            page_table = self.full_to_swa_index_mapping[metadata.page_table].to(
+                torch.int32
+            )
+        else:
+            page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
@@ -1923,7 +1935,9 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def _update_local_attn_metadata_for_replay(
-        self, metadata: FlashAttentionMetadata, bs: int
+        self,
+        metadata: FlashAttentionMetadata,
+        bs: int,
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
         if self.attention_chunk_size is None:
@@ -1954,7 +1968,12 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = metadata.page_table[:bs, :max_seq_len]
+        if self.is_hybrid:
+            sliced_page_table = self.full_to_swa_index_mapping[
+                metadata.page_table[:bs, :max_seq_len]
+            ].to(torch.int32)
+        else:
+            sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()
@@ -2066,7 +2085,7 @@ class FlashAttentionMultiStepBackend:
 # @torch.compile(dynamic=True, backend=get_compiler_backend())
 # TODO: fuse these kernels
 # NOTE: torch.compile makes it slower in speculative decoding
-def normal_decode_set_medadata(
+def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     page_table: torch.Tensor,

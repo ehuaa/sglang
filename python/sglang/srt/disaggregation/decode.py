@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -184,9 +185,13 @@ class DecodePreallocQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
-        attn_tp_size = self.tp_size // self.dp_size
+        attn_tp_size = get_attention_tp_size()
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+
         kv_args.decode_tp_size = attn_tp_size
+        # Note(shangming): pp is not supported on the decode side yet, so its rank is fixed to 0
+        kv_args.pp_rank = 0
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -416,6 +421,12 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
+    @property
+    def num_tokens_pre_allocated(self):
+        return sum(
+            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
+        )
+
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> int:
@@ -433,7 +444,13 @@ class DecodePreallocQueue:
             else 0
         )
 
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        if self.scheduler.model_config.is_hybrid:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
 
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
@@ -606,9 +623,21 @@ class DecodeTransferQueue:
                             : decode_req.req.top_logprobs_num
                         ].tolist()
                     )
+
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
-                transferred_reqs.append(decode_req.req)
+
+                # special handling for sampling_params.max_new_tokens == 1
+                if decode_req.req.sampling_params.max_new_tokens == 1:
+                    # finish immediately
+                    decode_req.req.check_finished()
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    self.tree_cache.cache_finished_req(decode_req.req)
+                else:
+                    transferred_reqs.append(decode_req.req)
+
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -670,10 +699,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -747,16 +773,13 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
 
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch, _ = self.prepare_mlp_sync_batch(batch)
+        batch = self.prepare_mlp_sync_batch(batch)
         result = None
         if batch:
             result = self.run_batch(batch)

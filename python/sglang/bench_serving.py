@@ -265,40 +265,58 @@ async def async_request_openai_completions(
     return output
 
 
-# set ignore_eos True by default
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
+    """Makes a request to the OpenAI Chat Completions API.
+
+    Handles both streaming and non-streaming responses, including support
+    for image data in messages. Calculates and returns various performance
+    metrics.
+
+    Args:
+        request_func_input: Input parameters for the request.
+        pbar: Optional tqdm progress bar to update.
+
+    Returns:
+        RequestFuncOutput: Output of the request, including generated text,
+                           latency, TTFT, ITL, and success status.
+    """
     api_url = request_func_input.api_url
     assert api_url.endswith(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
-    prompt = request_func_input.prompt
+    if request_func_input.image_data:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": request_func_input.image_data},
+                    },
+                    {"type": "text", "text": request_func_input.prompt},
+                ],
+            },
+        ]
+    else:
+        messages = [{"role": "user", "content": request_func_input.prompt}]
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "model": request_func_input.model,
-            "messages": [ 
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "temperature": 0.0,
-            "stream": not args.disable_stream,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-            "top_p": 1.0,
-            "ignore_eos": not args.disable_ignore_eos,
             "max_tokens": request_func_input.output_len,
+            "stream": not args.disable_stream,
+            "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
 
-        output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -310,42 +328,63 @@ async def async_request_openai_chat_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+                    if args.disable_stream:
+                        # Non-streaming response
+                        response_json = await response.json()
+                        output.generated_text = response_json["choices"][0]["message"][
+                            "content"
+                        ]
+                        output.success = True
+                        output.latency = time.perf_counter() - st
+                        output.ttft = (
+                            output.latency
+                        )  # For non-streaming, TTFT = total latency
+                        output.output_len = response_json.get("usage", {}).get(
+                            "completion_tokens", output_len
+                        )
+                    else:
+                        # Streaming response
+                        async for chunk_bytes in response.content:
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes:
+                                continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                            latency = time.perf_counter() - st
+                            if chunk == "[DONE]":
+                                pass
+                            else:
+                                data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["delta"].get("content", ""):
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                # Check if this chunk contains content
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                                if content:
+                                    timestamp = time.perf_counter()
+                                    # First token
+                                    if ttft == 0.0:
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
 
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["delta"].get("content", "")
+                                    # Decoding phase
+                                    else:
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
+
+                                    most_recent_timestamp = timestamp
+                                    generated_text += content
+
+                                # Check for usage info in final chunk
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
-                    
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
+
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = latency
+                        output.output_len = output_len
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -610,20 +649,6 @@ def get_dataset(args, tokenizer):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name == "geogpt":
-        input_requests = sample_geogpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.geogpt_output_len
-        )
-    elif args.dataset_name == "geogpt-intent":
-        input_requests = sample_geogpt_intent_shared_prefix_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.geogpt_output_len
-        )
     elif args.dataset_name.startswith("random"):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
@@ -652,6 +677,7 @@ def get_dataset(args, tokenizer):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.random_output_len,
+            apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
     else:
@@ -664,8 +690,10 @@ ASYNC_REQUEST_FUNCS = {
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "sglang-oai-chat": async_request_openai_chat_completions,
-    "vllm": async_request_openai_chat_completions,
+    "vllm": async_request_openai_completions,
+    "vllm-chat": async_request_openai_chat_completions,
     "lmdeploy": async_request_openai_completions,
+    "lmdeploy-chat": async_request_openai_chat_completions,
     "trt": async_request_trt_llm,
     "gserver": async_request_gserver,
     "truss": async_request_truss,
@@ -705,7 +733,7 @@ class BenchmarkMetrics:
     concurrency: float
 
 
-SHAREGPT_URL = "https://modelscope.cn/datasets/gliang1001/ShareGPT_V3_unfiltered_cleaned_split/resolve/master/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -742,111 +770,6 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def sample_geogpt_intent_shared_prefix_requests(
-    dataset_path: str,
-    num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
-    fixed_output_len: Optional[int] = None,
-)-> List[Tuple[str, int, int]]:
-    if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
-    input_template = "You are a helpful expert in geoscience. You will be given access to a set of tools that can help you to answer the question. Your answer must be correct, accurate and written by a geoscientist using a unbiased and professional tone. Answer the questions as best you can.\nYour goal is to select the first-level tool and the corresponding second-level tool. If the second-level tool is not in the subdirectory of the first-level tool, your answer will be invalid and you will be penalized.\n\n## Tools\nThere are the first-level tools and their corresponding second-level tools:\nGeneral_Chat: General_Chat\nScholar_Search: Scholar_Search\nInformation_Retrieval: Information_Retrieval_Fact_Inquiry_Weather,Information_Retrieval_Fact_Inquiry_Date\nDocument_Parsing: Document_Parsing\nData_Visualization: Data_Visualization_Map_Scatter_Plot,Data_Visualization_Stereogram,Data_Visualization_Line_Chart,Data_Visualization_Bar_Chart\n\n## Task\nTo complete the task, follow these three steps:\nSTEP 1: You have to decide which first-level tool you access to choose:\nIf the query requests the most recent academic research, the latest research findings, case studies on recent advancements (including their pros and cons, methodologies, examples, and research developments), or suggestions for relevant books, or “学术研究”, “研究成果”, “案例”, “书籍”, the first-level tool is \"General_Chat\".\nIf the query requests “书籍论文(book papers)”, “会议论文”, the first-level tool is \"Scholar_Search\".\n\n\nGeneral_Chat: encompasses a broad range of conversational interactions. This can include translating or answering  in different languages,defining terms, providing examples, drafting literature, writing code, discussing scientific phenomena or some simple factual queries. Different from Document_Parsing,it does not involve the specific content of the document , but only relies on existing knowledge.In these interactions, the user poses a question that may require a descriptive response, instructional guidance, problem-solving, or an explanation of concepts and processes. When it comes to factual queries, they usually involve queries about oil price information, flight information, exchange rate information, stock markets, online shopping processes, game scores, etc.If the query requests the most recent academic research, the latest research findings, case studies on recent advancements (including their pros and cons, methodologies, examples, and research developments), or suggestions for relevant books, or “学术研究”，“研究成果”，“案例”，“书籍”， the first-level tool is \"General_Chat\".\nScholar_Search: This tool assists users in locating scholarly materials, including papers, literature, articles, patents, and technical guides. It is specifically designed for objective queries, distinct from those requiring opinions or subjective interpretations. The primary function is to identify documents related to specific topics rather than applying the content of these documents to address practical issues. It is crucial to note that if the query involves searching for recent scholarly works (such as academic studies, scholarly research, cases, books or “学术研究”，“研究成果”，“案例”，“书籍”), the first-level tool to be used is \"General_Chat\".\nInformation_Retrieval: some tools that can help user obtain the current date or weather conditions.When it comes to date queries, queries usually ask \"Current Date and Time\", \"Day of the Week\", \"Day of the Year\", \"time on the calendar\", \"tomorrow\", etc. It should be noted that if the query asks about something that happened on a certain day, the first-level tool is \"General_Chat\". There is an example: \"What is the average exchange rate of Euro to Japanese Yen this week?\", its first-level tool is \"General_Chat\".When it comes to weather queries, only when the query asks about \"Temperature\", \"Humidity\", \"Wind\", \"Precipitation\", \"Visibility\", \"Cloud Cover\", \"UV Index\", \"Air Quality Index (AQI)\", \"Pressure\", \"Dew Point\", \"Sunrise and Sunset Times\", the first-level tool is \"Information_Retrieval\". It should be noted that if the query asks about the weather conditions more than one year in the future, the first-level tool is \"General_Chat\", there is an example: \"What will the temperature be in 2100\", its first-level tool is \"General_Chat\". At the same time, if the query is about sea level height, carbon dioxide content, etc., its first-level tool is \"General_Chat\".\nDocument_Parsing: It involves the specific content of the document. It refers to the process of systematically analyzing a document to extract specific information or answer queries based on its content.When responding to queries, it is essential to have a source document from which the information is derived. This ensures that answers are grounded in the document and are not provided arbitrarily.There are pronouns such as \"the paper\",\"the resarch\",\"the article\",\"the laterature\" and so on indicating that the content of the article is used.Terms such as \"in the paper\",\"The paper used\",\"This study\",\"in the article\",\"gather information from the paper\" \"from the study,\" or \"within this paper\" indicate that the response is based on document parsing, meaning that the information provided is not generic but is instead extracted from a particular document that has been uploaded or referenced. \nData_Visualization: some tools that can help user to draw chart from given data.It only includes the following types of charts，such as Map_Scatter_Plot,Stereogram(Aitoff projection,stereonet),Line_Chart,Bar_Chart.\nFor Scholar_Search and Document_Parsing, if the query mentions that it involves collecting some data and content from articles or research, the first-level tool is \"Document Parsing\".There is an example:\"收集文献中详细介绍的地层中发现的沉积结构类型的信息。\",its first-level tool is \"Document_Parsing\".\nFor General_Chat and Information_Retrieval, only if the query is asking for the date or weather,the first-level tool is \"Information_Retrieval\",esle the first-level tool is \"General_Chat\"\nFor General_Chat and Scholar_Search, the first-level tool is \"Scholar_Search\" only when the query specifically seeks scholarly works such as papers, literature, articles, patents, and technical guides. For all other types of queries, \"General_Chat\" should be used as the first-level tool. Additionally, if the query is focused on finding recent scholarly studies(academic studies),  including scholarly research, cases, books, or “学术研究”，“研究成果”，“案例”，“书籍\"，General_Chat\" should also be employed as the first-level tool.\nFor Document_Parsing and Data_Visualization, when it comes to extracting information from documents(paper,article), or if there is already a document(paper,article), extracting information from a table in an document(paper,article), etc., the first-level tool is \"Document Parsing\".\nFor General_Chat and Data_Visualization, If the query asks for the specific information in the above visualization, such as the total number of points, the highest point, the trend of the previous visualization figure(chart,graph), etc.,the first-level tool is \"General_Chat\".\nFor General_Chat and Document_Parsing, When the query involves searching for article titles, authors, years, central ideas, etc,or the query contains terms such as \"in the paper\",\"The paper used\",\"This study\",\"in the article\",\"gather information from the paper\" \"from the study,\" or \"within this paper\", its first-level tool is \"Document_Parsing\".\n\nSTEP 2: It is important to emphasize again the ownership of second-level tool and first-level tool.\nyou must know that under each first-level tool, there are many second-level tool.You need to determine the the second-level tool based on the selected first-level tool, and determine the final selected second-level tool.\n\nIf the first-level tool is \"General_Chat\",the second-level tool must be \"General_Chat\"\nIf the first-level tool is \"Scholar_Search\",the second-level tool must be \"Scholar_Search\"\nIf the first-level tool is \"Document_Parsing\",the second-level tool must be \"Document_Parsing\".\n\nIf the first-level tool is \"Information_Retrieval\",the second-level tool must be one of the the following second-level tools:\"Information_Retrieval_Fact_Inquiry_Weather\",\"Information_Retrieval_Fact_Inquiry_Date\"\nInformation_Retrieval_Fact_Inquiry_Weather: Refering to questions that users ask to obtain the weather conditions,such as \"Temperature\", \"Humidity\", \"Wind\", \"Precipitation\", \"Visibility\", \"Cloud Cover\", \"UV Index\", \"Air Quality Index (AQI)\", \"Pressure\", \"Dew Point\", \"Sunrise and Sunset Times\".\nInformation_Retrieval_Fact_Inquiry_Date: Refering to questions that users ask to obtain time and date information,such as \"Current Date and Time\", \"Day of the Week\", \"Day of the Year\", \"time on the calendar\", \"tomorrow\", etc.\n\nIf the first-level tool is \"Data_Visualization\",the second-level tool must be one of the the following second-level tools:\"Data_Visualization_Map_Scatter_Plot\",\"Data_Visualization_Stereogram\",\"Data_Visualization_Line_Chart\",\"Data_Visualization_Bar_Chart\"\nData_Visualization_Map_Scatter_Plot: The query must contains \"scatter plot\" or \"scatter\".A visual representation that uses dots placed on a map to show the distribution or relationship of geographical data.\nData_Visualization_Stereogram: If the query contains \"Aitoff projection\" or \"stereonet\",it must be \"Data_Visualization_Stereogram\".Else,it means a chart that presents a two-dimensional image in such a way that it gives the illusion of depth, creating a 3D perception when viewed correctly.\nData_Visualization_Line_Chart: If the query contains \"line chart\" or \"line\",it must be \"Data_Visualization_Line_Chart\".Else,it means a graph that uses lines to connect data points showing trends over time or categories.\nData_Visualization_Bar_Chart:  If the query contains \"bar chart\" or \"bar\",it must be \"Data_Visualization_Bar_Chart\".Else,it means a chart with rectangular bars representing different quantities or frequencies of data. Data that can be categorized or grouped, such as years, types of items, or sectors, are well-suited for bar_chart.Each bar represents a discrete, numerical value that is associated with a category. This could be quantities, prices, counts, or any other measurable figure.Bar charts are excellent for showing the relative size of data points. The length or height of the bar corresponds to the data value, making it straightforward to see which categories are larger or smaller.\nWhen the first-level tool is \"Data_Visualization\", If the query does not meet the above four conditions,it must be \"Data_Visualization_Line_Chart\".\n\nSTEP 3: the second-level tool must be under a subdirectory of the first-level tool.\nGeneral_Chat: General_Chat\nScholar_Search: Scholar_Search\nInformation_Retrieval: Information_Retrieval_Fact_Inquiry_Weather,Information_Retrieval_Fact_Inquiry_Date\nDocument_Parsing: Document_Parsing\nData_Visualization: Data_Visualization_Map_Scatter_Plot,Data_Visualization_Stereogram,Data_Visualization_Line_Chart,Data_Visualization_Bar_Chart\n\n## Output\nFinally,Use the following format in your reply.\nThought: Your thought process on this issue, only select the type and don't need to really answer the question.\nType: The result you reach base on your thought, must be in json format {\"first-level\":\"\",\"second-level\":\"\"}.\n\n\n\n## Examples\nBelow are examples with their respective category. Please classify the chat content according to the following cases.\n1. Query:\"The paper used Principal Component Analysis (PCA) in the dimensionality reduction of geological data features. How can this method specifically improve the signal-to-noise ratio of the data, and what impact does it have on the classification performance of subsequent machine learning models? \"\nType: {\"first-level\":\"Document_Parsing\",\"second-level\":\"Document_Parsing\"}\n2. Query:Please identify and list the tectonic settings described in the study. \nType: {\"first-level\":\"Document_Parsing\",\"second-level\":\"Document_Parsing\"}\n3. Query:Help me extract the year the article was first published.\nType: {\"first-level\":\"Document_Parsing\",\"second-level\":\"Document_Parsing\"}\n4. Query:Find the list of Nobel Prize winners this year. \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n5. Query:现在文章抽取的工具有哪些. \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n6. Query:What is the average exchange rate of Euro to Japanese Yen this week? \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n7. Query:what is the average value of the turbulence in the ocean. \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n8. Query:What does today's solar activity report show? \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n9. Query:推荐一些地理学方面的书籍? \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n10. Query:找一下关于板块运动相关的专利? \nType: {\"first-level\":\"Scholar_Search\",\"second-level\":\"Scholar_Search\"}\n11. Query:Please search for scholarly(or academic) studies on earthquake.? \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n12. Query:帮我找一些关于风能和太阳能资源评估的最新学术研究? \nType: {\"first-level\":\"General_Chat\",\"second-level\":\"General_Chat\"}\n\n\nBegin!\nThe current chat content is\n%s\n"
-    dataset = []
-    # load dataset from folder
-    for filename in os.listdir(dataset_path):
-        file_path = os.path.join(dataset_path, filename)
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line.strip())
-                dataset.append(data["query"])
-
-    # Shuffle the dataset.
-    random.shuffle(dataset)
-
-    # Filter out sequences that are too long or too short
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for i in range(len(dataset)):
-        if len(filtered_dataset) == num_requests:
-            break
-
-        # Tokenize the prompts and completions.
-        prompt = input_template % (dataset[i])
-
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        # prompt = prompt.replace(tokenizer.bos_token, "")
-
-        prompt_token_ids = tokenizer.encode(prompt)
-        prompt_len = len(prompt_token_ids)
-        output_len = fixed_output_len
-
-        if prompt_len < 2 or output_len < 2:
-            # Prune too short sequences.
-            continue
-
-        filtered_dataset.append((prompt, prompt_len, output_len))
-
-    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
-    return filtered_dataset    
-
-def sample_geogpt_requests(
-    dataset_path: str,
-    num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
-    fixed_output_len: Optional[int] = None,
-) -> List[Tuple[str, int, int]]:
-    if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
-    
-    dataset = []
-    # load dataset from folder
-    for filename in os.listdir(dataset_path):
-        file_path = os.path.join(dataset_path, filename)
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line.strip())
-                dataset.append(data["question"])
-
-    # Shuffle the dataset.
-    random.shuffle(dataset)
-
-    # Filter out sequences that are too long or too short
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for i in range(len(dataset)):
-        if len(filtered_dataset) == num_requests:
-            break
-
-        # Tokenize the prompts and completions.
-        prompt = dataset[i]
-
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        # for qwen comment replace bos_token, for deepseek uncomment
-        prompt = prompt.replace(tokenizer.bos_token, "")
-
-        prompt_token_ids = tokenizer.encode(prompt)
-        prompt_len = len(prompt_token_ids)
-        output_len = fixed_output_len
-
-        if prompt_len < 2 or output_len < 2:
-            # Prune too short sequences.
-            continue
-
-        filtered_dataset.append((prompt, prompt_len, output_len))
-
-    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
-
-
 def is_file_valid_json(path):
     if not os.path.isfile(path):
         return False
@@ -875,6 +798,7 @@ def sample_mmmu_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    apply_chat_template: bool = True,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
     """
@@ -884,15 +808,16 @@ def sample_mmmu_requests(
         num_requests: Number of requests to sample.
         tokenizer: Tokenizer to use for token counting.
         fixed_output_len: If provided, use this fixed output length for all requests.
+        apply_chat_template: Whether to apply the chat template to the prompt.
         random_sample: Whether to randomly sample or take the first N.
 
     Returns:
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
     try:
-        import base64
         import io
 
+        import pybase64
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
@@ -943,7 +868,7 @@ def sample_mmmu_requests(
                     # Encode image to base64
                     buffered = io.BytesIO()
                     image.save(buffered, format="JPEG")
-                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
                     image_data = f"data:image/jpeg;base64,{img_str}"
                 else:
                     continue
@@ -953,28 +878,30 @@ def sample_mmmu_requests(
 
                 # Construct the prompt
                 prompt = f"Question: {question}\n\nAnswer: "
-
-                try:
-                    prompt = tokenizer.apply_chat_template(
-                        [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": image_data},
-                                    },
-                                    {"type": "text", "text": prompt},
-                                ],
-                            }
-                        ],
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
-                except Exception as e:
-                    # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-                    print(f"Error applying chat template: {e}, fallback to <image> tag")
-                    prompt = f"<image>{prompt}"
+                if apply_chat_template:
+                    try:
+                        prompt = tokenizer.apply_chat_template(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {"url": image_data},
+                                        },
+                                        {"type": "text", "text": prompt},
+                                    ],
+                                }
+                            ],
+                            add_generation_prompt=True,
+                            tokenize=False,
+                        )
+                    except Exception as e:
+                        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
+                        print(
+                            f"Error applying chat template: {e}, fallback to <image> tag"
+                        )
+                        prompt = f"<image>{prompt}"
 
                 # Calculate token lengths for text only (without image data)
                 prompt_token_ids = tokenizer.encode(prompt)
@@ -1733,7 +1660,6 @@ def run_benchmark(args_: argparse.Namespace):
             "sglang": 30000,
             "sglang-native": 30000,
             "sglang-oai": 30000,
-            "sglang-oai-chat": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
             "trt": 8000,
@@ -1753,13 +1679,13 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/generate"
         )
-    elif args.backend in ["sglang-oai", "lmdeploy"]:
+    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/completions"
         )
-    elif args.backend in ["sglang-oai-chat", "vllm"]:
+    elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
@@ -1894,7 +1820,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "geogpt", "geogpt-intent", "mmmu"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1921,12 +1847,6 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
-    )
-    parser.add_argument(
-        "--geogpt-output-len",
-        type=int,
-        default=None,
-        help="Output length for each request. Overrides the output length from the GeoGPT dataset.",
     )
     parser.add_argument(
         "--sharegpt-context-len",
