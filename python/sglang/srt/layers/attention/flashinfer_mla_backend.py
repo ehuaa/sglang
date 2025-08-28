@@ -192,6 +192,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not global_server_args_dict["disable_chunked_prefix_cache"]
             and not global_server_args_dict["flashinfer_mla_disable_ragged"]
         )
+        self.page_size = model_runner.page_size
 
         # Allocate buffers
         global global_workspace_buffer
