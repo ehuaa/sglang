@@ -383,15 +383,20 @@ def _finalize_accept_tree_path(
     *,
     token_to_kv_pool_allocator: Any,
     num_draft_tokens: int,
+    pp_enabled: bool,
 ) -> torch.Tensor:
     """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
     hidden_states -- to the contiguous front of each per-req block, which the
     downstream chain-layout code (draft-extend select_index, committed-KV reads)
     assumes. Returns compacted predict; mutates logits_output.hidden_states
     (moved only when present)."""
-    move_accept_tokens_to_target_kvcache(
-        batch, accept_index, accept_lens - 1, token_to_kv_pool_allocator
-    )
+    # Under PP, the accepted tree path is relaid across PP ranks via the
+    # proxy hidden ring, so the local KV slot move would desync rank-local
+    # KV state from the PP-relayed token order. Skip it under PP.
+    if not pp_enabled:
+        move_accept_tokens_to_target_kvcache(
+            batch, accept_index, accept_lens - 1, token_to_kv_pool_allocator
+        )
     predict = _compact_accept_to_front(
         predict, accept_index, bs, num_draft_tokens=num_draft_tokens
     )
@@ -442,6 +447,9 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    pp_enabled: bool,
+    pp_is_last_rank: bool,
+    pp_proxy_tensors: Any = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -529,9 +537,15 @@ def run_eagle_verify(
     forward_batch_output = target_worker.forward_batch_generation(
         batch=None,
         forward_batch=verify_forward_batch,
+        pp_proxy_tensors=pp_proxy_tensors,
         is_verify=True,
     )
     logits_output = forward_batch_output.logits_output
+
+    # Non-last PP rank: only proxy hidden states, no logits — skip the
+    # sample/accept/grammar post-processing below.
+    if pp_enabled and not pp_is_last_rank:
+        return forward_batch_output
 
     # Generate vocab mask for constrained decoding
     vocab_mask = None
@@ -614,6 +628,7 @@ def run_eagle_verify(
             bs,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             num_draft_tokens=num_draft_tokens,
+            pp_enabled=pp_enabled,
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)

@@ -254,6 +254,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+            pp_global_random_seed: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -310,17 +311,21 @@ class TpModelWorker(BaseTpWorker):
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Sync random seed across TP workers.
-        # Scale joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_scale_joiner:
-            self.random_seed = server_args.random_seed
+        # Under PP, the draft worker's TP worker is created on only one PP rank
+        # (typically the last). No broadcast is needed — reuse the target
+        # worker's random seed directly.
+        if self.is_draft_worker and self.server_args.pp_size > 1:
+            assert (
+                    pp_global_random_seed is not None
+            ), "pp_global_random_seed must be provided for the draft worker under PP"
+            self.random_seed = pp_global_random_seed
         else:
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],
                 self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
-            )[0]
+                )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
