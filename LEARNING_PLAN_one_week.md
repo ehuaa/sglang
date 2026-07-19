@@ -4,11 +4,19 @@
 **目标**：一周后能独立读懂 `DEV_PLAN_support_pp_mtp_pd.md` 中每个任务引用的代码位置，并有能力开始 Week 1 的开发。
 **方法**：每天 = 原理阅读（上午）+ 代码走读（下午）+ 动手实验（傍晚）+ 自测问题。所有文件路径基于 `python/sglang/srt/`。
 
+**关于链接**：arXiv/GitHub/官方文档给直链（稳定）；知乎/B 站内容链接易失效，给出**作者/专栏名 + 搜索关键词**，按关键词搜即可。
+
 ---
 
 ## Day 1：整体架构与一次请求的生命周期
 
 **原理**：sglang 三进程模型——TokenizerManager（HTTP 入口/分词）→ Scheduler（组 batch/调度，每 GPU rank 一个）→ TpModelWorker/ModelRunner（前向执行）；返回路径经 DetokenizerManager。
+
+**参考资料**：
+- 官方文档（英）：https://docs.sglang.io/ ——先通读 Getting Started 与 Backend/Server Arguments 两章
+- SGLang 论文（英）：*SGLang: Efficient Execution of Structured Language Model Programs*，https://arxiv.org/abs/2312.07104 （只读系统架构与 RadixAttention 部分）
+- 中文入门（知乎搜索）：`SGLang 源码解析 架构`、`SGLang Scheduler 源码`；系统性中文材料可看 B 站 **ZOMI酱** 的《AI 系统》大模型推理章节（配套仓库 https://github.com/chenzomi12/AISystem ）
+- 大模型推理基础概念（中文，知乎）：**猛猿**《图解大模型》系列中"推理"相关篇目（搜索：`猛猿 图解大模型 推理`）
 
 **代码走读**（按调用链顺序）：
 1. `entrypoints/http_server.py`（找 `/generate` 路由）→ `managers/tokenizer_manager.py`
@@ -23,6 +31,11 @@
 
 **原理**：`req_to_token_pool`（请求→token 槽位表）与 `token_to_kv_pool`（槽位→各层 KV 数据）两级结构；radix cache 前缀复用；chunked prefill。
 
+**参考资料**：
+- PagedAttention 论文（英，KV cache 分页管理的思想源头）：*Efficient Memory Management for Large Language Model Serving with PagedAttention*，https://arxiv.org/abs/2309.06180
+- RadixAttention：上面 SGLang 论文的对应章节
+- 中文（知乎搜索）：`PagedAttention 图解`、`KV Cache 原理 图解`、`RadixAttention 前缀缓存`、`chunked prefill 是什么`
+
 **代码走读**：
 1. `mem_cache/memory_pool.py`：`ReqToTokenPool`、KV pool 的 `get_contiguous_buf_infos`（后面 PD 传输就靠它拿层指针，务必看懂）
 2. `managers/schedule_batch.py`：`ScheduleBatch` 字段——`seq_lens`、`out_cache_loc`、`forward_mode`
@@ -36,8 +49,16 @@
 
 **原理阅读**：
 - 投机解码基本思想：小模型 draft k 个 token → 大模型一次前向 verify → 按拒绝采样/贪心接受前缀，**无损**（输出分布不变）
-- EAGLE 论文（v1/v2）：draft 输入 = target 上一步的 hidden state + token embedding；树形 draft（topk>1）
-- DeepSeek-V3 技术报告的 MTP 章节：MTP = 训练时的多 token 预测头，推理时当 EAGLE 式 draft 用（sglang 里 NEXTN）
+- EAGLE：draft 输入 = target 上一步的 hidden state + token embedding；树形 draft（topk>1）
+- MTP：训练时的多 token 预测头，推理时当 EAGLE 式 draft 用（sglang 里叫 NEXTN）
+
+**参考资料**：
+- 投机解码开山两篇（英）：*Fast Inference from Transformers via Speculative Decoding*，https://arxiv.org/abs/2211.17192 ；*Accelerating Large Language Model Decoding with Speculative Sampling*，https://arxiv.org/abs/2302.01318
+- 入门友好的博客（英）：HuggingFace *Assisted Generation*，https://huggingface.co/blog/assisted-generation
+- EAGLE 系列（英）：EAGLE-1 https://arxiv.org/abs/2401.15077 ；EAGLE-2（动态树）https://arxiv.org/abs/2406.16858 ；EAGLE-3 https://arxiv.org/abs/2503.01840 （精读 EAGLE-1，其余略读）
+- 树形 draft 的另一代表（英，选读）：*Medusa*，https://arxiv.org/abs/2401.10774
+- MTP（英）：*DeepSeek-V3 Technical Report* 的 Multi-Token Prediction 章节，https://arxiv.org/abs/2412.19437
+- 中文（知乎搜索）：`投机采样 speculative decoding 图解`、`EAGLE 投机解码 原理`、`DeepSeek MTP 原理`、`猛猿 投机采样`
 
 **代码走读**：
 1. `speculative/spec_info.py`：`SpeculativeAlgorithm`、`SpecInput` 基类
@@ -53,10 +74,14 @@
 
 **原理**：按层切分模型到多个 stage；microbatch 流水；stage 间只传 hidden states；lm_head 在 last rank、embed 在 first rank；气泡（bubble）概念。
 
+**参考资料**：
+- GPipe 论文（英，PP 与 microbatch 的源头）：https://arxiv.org/abs/1811.06965 （读懂 Fig.2 的 bubble 示意即可）
+- 中文（知乎搜索）：`流水线并行 GPipe 图解`、`猛猿 图解大模型训练 流水线并行`（训练视角，但 bubble/microbatch 概念相通）、`大模型推理 pipeline parallelism`
+- sglang PP 的一手资料：PR [#5724](https://github.com/sgl-project/sglang/pull/5724)（初版）与 [#11852](https://github.com/sgl-project/sglang/pull/11852)（新事件循环）的描述部分；roadmap [#11857](https://github.com/sgl-project/sglang/issues/11857)
+
 **代码走读**：
 1. `managers/scheduler_pp_mixin.py` 的 `event_loop_pp`（68 行起）：microbatch 环（`mbs[mb_id]`）、`_pp_recv_proxy_tensors` / `_pp_send_dict_to_next_stage`（hidden 接力）、输出 dict 的环形回传（last rank 的采样结果绕回 rank 0）
 2. `model_executor/forward_batch_info.py` 的 `PPProxyTensors`
-3. 辅助阅读：PR #5724（sglang PP 初版）、#11852（新事件循环）的描述部分
 
 **动手**：两卡 `--pp-size 2` 起服务（`--disable-overlap-schedule`），发请求；对照日志理解 rank 0 和 rank 1 各自在做什么。
 
@@ -66,20 +91,31 @@
 
 **原理**：P 节点只做 prefill、D 节点只做 decode；KV cache 经 RDMA（mooncake/nixl）从 P 传到 D；bootstrap 握手、metadata（首 token、logprob 等）随传。
 
+**参考资料**：
+- PD 分离思想两篇（英）：*DistServe*，https://arxiv.org/abs/2401.09670 ；*Splitwise*，https://arxiv.org/abs/2311.18677 （读 motivation 与架构图即可）
+- Mooncake 论文（英，sglang 默认传输后端的来源）：https://arxiv.org/abs/2407.00079
+- 官方文档：https://docs.sglang.io/ 的 PD Disaggregation 章节
+- 中文（知乎搜索）：`PD 分离 大模型推理`、`Mooncake KVCache 分离`、`SGLang PD 分离 部署`
+- 一手资料：PR [#8846](https://github.com/sgl-project/sglang/pull/8846)（PD+PP 兼容）、[#17212](https://github.com/sgl-project/sglang/pull/17212)（P 不开 spec + D 开 spec 的 bugfix，含完整部署命令，动手模板）
+
 **代码走读**：
 1. `disaggregation/prefill.py`：KV sender 注册（约 155-200 行，`get_contiguous_buf_infos` + `prefill_start_layer/end_layer`）、`send_kv_chunk` + `set_buf`（约 1060-1090 行）
 2. `disaggregation/decode.py`：receiver 注册（约 420-470 行）、`_commit_transfer_to_req`（metadata 落到 req，约 1670-1790 行）
 3. `disaggregation/utils.py` 的 `MetadataBuffers`（约 290-490 行）：注意 spec 相关的 `output_topk_p / hidden_states` 字段
 4. `disaggregation/decode_schedule_batch_mixin.py` 的 `process_prebuilt`：转移来的请求如何以 PREBUILT 模式进入 decode
-5. 辅助：PR #17212 的描述（P 不开 spec + D 开 spec 的 bugfix，含完整部署命令，可作为动手模板）
+5. `mem_cache/kv_cache_builder.py:54` 的 `get_draft_kv_pool`：draft pool 如何接入 PD sender（算法无关 + PP guard，Week 1/Backlog 都用到）
 
 **动手**：单机双实例 PD 部署（照 #17212 的脚本改），跑通一个请求；然后 D 加 `--speculative-algorithm EAGLE` 复现"冷启动模式"。
 
-**自测**：draft KV 什么情况下会随 target KV 一起传？（`prefill.py:186` 的条件）D 端怎么重建投机解码的初始状态？（`build_eagle_disagg_draft_input`）
+**自测**：draft KV 什么情况下会随 target KV 一起传？（`prefill.py:186` 的条件）D 端怎么重建投机解码的初始状态？（`build_disagg_draft_input`，注意它目前是 EAGLE-only）
 
 ## Day 6：精读 #31139（colocated PP + 投机解码）
 
-**原理**：读 PR #31139 描述全文，核心设计三条——draft 整体只驻 last rank；每轮跨 rank 只传 token 级 raw（`EaglePPVerifyInputRaw`）；所有 rank 用同一份 accept 结果做延迟的 KV 记账，保证各 rank 的 allocator 账本逐字节一致。
+**原理**：读 PR [#31139](https://github.com/sgl-project/sglang/pull/31139) 描述全文，核心设计三条——draft 整体只驻 last rank；每轮跨 rank 只传 token 级 raw（`EaglePPVerifyInputRaw`）；所有 rank 用同一份 accept 结果做延迟的 KV 记账，保证各 rank 的 allocator 账本逐字节一致。
+
+**参考资料**：
+- PR #31139 描述全文（含 Approach / Key design decisions / Known Limitations）
+- 对照读 RFC [#23162](https://github.com/sgl-project/sglang/issues/23162)：另一种"draft 在 first+last rank 两份"的设计及其被否的原因（跨 rank 增量 KV 同步太重），理解 #31139 单 rank 设计的取舍
 
 **代码走读**（都在本分支上，已 merge）：
 1. `speculative/eagle_info.py` 尾部：`EaglePPVerifyInputRaw`（载体：draft/bonus tokens、树拓扑、accept 结果、`build_dummy_for_decode`）
@@ -96,6 +132,12 @@
 
 **原理**：DFlash = 块扩散（block diffusion）式 draft——draft 模型一次前向并行生成固定 `block_size` 个候选 token（非自回归），target 线性 verify 接受前缀。与 EAGLE 的区别：无树、verify 窗口定长、draft 是独立小模型（需 `--speculative-draft-model-path`）、draft KV 来自 target hidden 注入。
 
+**参考资料**：
+- 块扩散语言模型背景（英）：*Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models*（BD3-LM，ICLR 2025），arXiv 搜索标题即可
+- 扩散语言模型科普（中文，知乎搜索）：`扩散语言模型 diffusion LLM 原理`、`block diffusion 语言模型`
+- DFlash 在 sglang 中无独立论文可引，**以代码为一手资料**：`speculative/dflash_worker_v2.py` 顶部注释与 `arg_groups/speculative_hook.py` 的 `_handle_dflash`；GitHub 上搜 sglang 仓库 `DFLASH` 相关 PR 的描述
+- 对比理解（英，选读）：EAGLE（自回归 draft）vs DFlash（并行块 draft）——为什么后者 verify 布局天然是静态定长的
+
 **代码走读**：
 1. `arg_groups/speculative_hook.py` 的 `_handle_dflash`（147 行起）：现有限制清单（CUDA only、无 dp-attention、无 PP——158 行的 reject 就是 Week 2 要放开的）
 2. `speculative/dflash_worker_v2.py`：`__init__`（157 行起，`build_draft_tp_worker`、block_size 推导）、`forward_batch_generation`（1295 行起）——extend 分支（FULL hidden capture → `_append_target_hidden_to_draft_kv_by_loc` 铺 draft KV）和 decode 分支（"Draft a fixed block"、用 target 的 embed/lm_head、`_greedy_sample_from_vocab_parallel_head`）
@@ -107,6 +149,29 @@
 **自测**（直接对应 Week 2 开发）：DFlash 的 verify 布局为什么是静态的？PP 下 last rank 没有 target embed（在 first rank），DFlash draft 怎么办？线性 verify 为什么不需要 accept 后的 KV 搬移？
 
 ---
+
+## 总参考书架（速查）
+
+| 主题 | 资料 | 链接 |
+|---|---|---|
+| sglang 官方文档 | Docs | https://docs.sglang.io/ |
+| sglang / RadixAttention | 论文 | https://arxiv.org/abs/2312.07104 |
+| KV cache 管理 | PagedAttention | https://arxiv.org/abs/2309.06180 |
+| 投机解码 | Leviathan et al. | https://arxiv.org/abs/2211.17192 |
+| 投机解码 | Chen et al. | https://arxiv.org/abs/2302.01318 |
+| 投机解码入门博客 | HF Assisted Generation | https://huggingface.co/blog/assisted-generation |
+| EAGLE-1/2/3 | 论文 | 2401.15077 / 2406.16858 / 2503.01840 |
+| Medusa | 论文 | https://arxiv.org/abs/2401.10774 |
+| MTP | DeepSeek-V3 报告 | https://arxiv.org/abs/2412.19437 |
+| PP | GPipe | https://arxiv.org/abs/1811.06965 |
+| PD 分离 | DistServe / Splitwise | 2401.09670 / 2311.18677 |
+| KV 传输 | Mooncake | https://arxiv.org/abs/2407.00079 |
+| 块扩散 LM | BD3-LM (ICLR'25) | arXiv 搜标题 |
+| 中文体系课 | ZOMI酱《AI系统》 | https://github.com/chenzomi12/AISystem + B站 |
+| 中文图解系列 | 猛猿《图解大模型》 | 知乎搜索 `猛猿 图解大模型` |
+| 系统全景（英，选读） | Stanford CS336 *Language Modeling from Scratch* | 搜索课程名 |
+
+**注**：知乎/B 站链接易变，统一给关键词；arXiv 编号如有出入以标题搜索为准。
 
 ## 贯穿一周的建议
 

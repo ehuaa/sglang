@@ -140,7 +140,17 @@
 
 # Backlog（两周之外，按优先级排序）
 
-1. **DFlash + PD（P 端 DFlash draft KV transfer）**：复用 Week 1 的层映射协议——DFlash draft pool 同样只在 P last rank；差异点：draft KV 由 target hidden 注入而非 draft 自回归产生（transfer 内容不变，仍是 pool 层指针）；若开 `draft_window_size` 紧凑缓存则映射需处理滑窗布局（首版可要求关闭 window）；D 端首步状态 = bonus token（DFlash 无 topk/hidden 依赖，比 MTP 的 metadata relay 更简单）
+1. **DFlash + PD**——回答"能否直接复用 Week 1 的 MTP 实现"：**传输协议层可复用，但不是零修改**。三类工作项区分如下：
+   - **可直接复用（无需改动）**：
+     - draft pool → PD sender 的接线是算法无关的：`mem_cache/kv_cache_builder.py:54` 的 `get_draft_kv_pool` 对 spec 算法不做区分（且已带 #31139 的 PP last-rank guard），`prefill.py:186` 的 draft 段发送条件只看 pool 是否存在
+     - Week 1 建立的 draft 层全局层号映射协议（draft KV 传输内容就是 pool 层指针字节，DFlash 的 draft KV 虽由 target hidden 注入产生，但存储形态与 MTP 无异）
+   - **需要新增（DFlash 专属，工作量小但必须做）**：
+     - **D 端首步 bootstrap**：`spec_info.py:164` 的 `build_disagg_draft_input` 是 EAGLE-only（`if self.is_eagle(): ... else return None`），DFLASH 走 PD 时 D 端 spec 状态不会重建。需写 DFlash 分支——比 EAGLE 简单：只需 bonus token + KV 账本初始化（`DFlashDraftInputV2` + `prepare_for_decode` 预分配），**不需要** topk_p/hidden_states
+     - P 端 metadata：`prefill.py:662` 的 `is_eagle()` 分支对 DFLASH 天然不写 topk/hidden——这恰好正确（DFlash 不需要），确认免除并加注释即可
+   - **需要验证/限制（首版收窄范围）**：
+     - DFlash + PD 连**非 PP 版都从未被支持/测试过**（上面 bootstrap 缺口即证据），建议先打通 `P(TP,DFLASH)+D(DFLASH)` 再叠 PP——PP 侧此时已是 Week 1+2 的既有能力
+     - `draft_window_size` 紧凑滑窗缓存的 pool 布局与线性布局不同，且 `get_draft_kv_pool` 取到的是哪个 pool 需确认（`dflash_worker_v2.py:287` 的 `draft_worker` 属性链）；首版要求关闭 window
+     - `scheduler.py:1130` 上方有一行 TODO 注释（"should we fix this when enabling mtp..."），说明 P 端 draft 传输的 wiring 本就欠打磨，排查时一并处理
 2. **D 端 PP（P PP+MTP + D PP+MTP，原 Phase 2 / ShangmingCai Step 2）**：
    - 层映射升级为 PP×PP 矩阵（Week 1 D2 设计已预留）
    - 首步 bootstrap 硬缺口：PREBUILT 批次不命中 `_pp_prep_batch_result` 的 spec 分支（`scheduler_pp_mixin.py:1151-1176`）——用 P 传来的 topk/bonus 构首步 raw
