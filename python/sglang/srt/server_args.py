@@ -329,6 +329,7 @@ DSA_CHOICES = [
     "tilelang",
     "aiter",
     "trtllm",
+    "triton",
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 

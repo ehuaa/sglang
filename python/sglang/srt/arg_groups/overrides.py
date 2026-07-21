@@ -1238,6 +1238,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     if not user_set_prefill and not user_set_decode and is_hip():
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
+    elif major == 8:
+        # Ampere (SM80/A100): FlashMLA sparse, fa3-MLA and trtllm sparse kernels
+        # are all SM90+; use the Triton sparse-MLA fallback for both phases.
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "triton"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"

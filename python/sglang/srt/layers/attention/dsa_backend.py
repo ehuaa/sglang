@@ -323,7 +323,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "triton"
 ]
 
 
@@ -456,6 +456,10 @@ class DeepseekSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        # SM count for the Triton sparse-MLA split-KV heuristic (SM80 path).
+        self.sm_count = torch.cuda.get_device_properties(
+            model_runner.device
+        ).multi_processor_count
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
@@ -1995,7 +1999,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif dsa_impl == "flashmla_sparse":
+        elif dsa_impl in ("flashmla_sparse", "triton"):
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
@@ -2012,7 +2016,12 @@ class DeepseekSparseAttnBackend(
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
 
-            return self._forward_flashmla_sparse(
+            sparse_fwd = (
+                self._forward_triton_sparse
+                if dsa_impl == "triton"
+                else self._forward_flashmla_sparse
+            )
+            return sparse_fwd(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -2152,10 +2161,15 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if self.dsa_decode_impl == "flashmla_sparse":
+        if self.dsa_decode_impl in ("flashmla_sparse", "triton"):
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_sparse(
+            sparse_fwd = (
+                self._forward_triton_sparse
+                if self.dsa_decode_impl == "triton"
+                else self._forward_flashmla_sparse
+            )
+            return sparse_fwd(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -2256,6 +2270,35 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_triton_sparse(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        # Ampere (SM80) sparse MLA: FlashMLA's sparse_prefill_fwd is SM90a/SM100
+        # only. The Triton kernel needs no head padding (BLOCK_H masks heads) and
+        # handles invalid (-1 / out-of-range) topk indices internally.
+        from sglang.kernels.ops.attention.dsa.mla_sparse_triton import (
+            triton_mla_sparse_attention,
+        )
+
+        num_tokens, num_heads, head_dim = q_all.shape
+        # kv_cache holds the [slots, 576] compressed latent (kv_lora_rank 512 +
+        # rope 64); indices index into the slot dimension.
+        kv = kv_cache.reshape(-1, 1, head_dim)
+        indices = page_table_1.unsqueeze(1)
+        o = triton_mla_sparse_attention(
+            q=q_all,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            sm_count=self.sm_count,
+        )
+        return o[..., :v_head_dim]
 
     def _forward_flashmla_sparse(
         self,
