@@ -958,7 +958,7 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        if _is_cuda and not self.paged_mqa_logits_backend.is_triton():
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -974,7 +974,38 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if self.paged_mqa_logits_backend.is_triton():
+            # Ampere (SM80) fallback: no DeepGEMM. Mirror the deepgemm native /
+            # split layouts but drop schedule_metadata (the Triton kernel derives
+            # its grid directly). next_n>=2 verify uses the [B, next_n] view;
+            # normal decode treats each query token as its own batch entry.
+            from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            weights_tri = weights[:q_offset]
+            if use_dg_native:
+                q_tri = q_fp8[:q_offset].view(
+                    B, next_n, q_fp8.shape[1], q_fp8.shape[2]
+                )
+                block_tables_tri = block_tables[::next_n]
+                context_lens_tri = seqlens_32_2d[:, 0].contiguous()
+            else:
+                q_tri = q_fp8[:q_offset].unsqueeze(1)
+                block_tables_tri = block_tables
+                context_lens_tri = (
+                    seqlens_32 if seqlens_32.dim() == 1 else seqlens_32[:, 0]
+                ).contiguous()
+            logits = fp8_paged_mqa_logits_triton(
+                q_tri,
+                kv_cache_fp8,
+                weights_tri,
+                context_lens_tri.to(torch.int32),
+                block_tables_tri,
+                max_seq_len,
+                clean_logits=False,
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1189,7 +1220,23 @@ class Indexer(MultiPlatformOp):
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
+                if self.paged_mqa_logits_backend.is_triton():
+                    from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+                        fp8_mqa_logits_triton,
+                    )
+
+                    # Ampere (SM80): Triton handles arbitrary head counts via
+                    # masking, so no _pad_heads_for_deep_gemm. clean_logits=False
+                    # to match the deep_gemm path (topk transform does masking).
+                    logits = fp8_mqa_logits_triton(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1248,7 +1295,20 @@ class Indexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                if _is_hip:
+                if self.paged_mqa_logits_backend.is_triton():
+                    from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+                        fp8_mqa_logits_triton,
+                    )
+
+                    logits_chunk = fp8_mqa_logits_triton(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1473,15 +1533,26 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_padded,
-                    kv_fp8,
-                    w_padded,
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if self.paged_mqa_logits_backend.is_triton():
+                    from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+                        fp8_mqa_logits_triton,
+                    )
+
+                    logits = fp8_mqa_logits_triton(
+                        q_fp8, kv_fp8, weights, ks, ke, clean_logits=False
+                    )
+                else:
+                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q_fp8, weights
+                    )
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_padded,
+                        kv_fp8,
+                        w_padded,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -1520,15 +1591,26 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_padded,
-                    kv_fp8,
-                    w_padded,
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if self.paged_mqa_logits_backend.is_triton():
+                    from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+                        fp8_mqa_logits_triton,
+                    )
+
+                    logits = fp8_mqa_logits_triton(
+                        q_fp8, kv_fp8, weights, ks, ke, clean_logits=False
+                    )
+                else:
+                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q_fp8, weights
+                    )
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_padded,
+                        kv_fp8,
+                        w_padded,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )

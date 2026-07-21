@@ -334,7 +334,13 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
+    "auto",
+    "deepgemm",
+    "cutedsl",
+    "aiter",
+    "triton",
+]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",

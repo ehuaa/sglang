@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from enum import Enum
 
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import is_hip, is_sm90_supported, is_sm100_supported
 
 
 class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    TRITON = "triton"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -18,6 +19,9 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_triton(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TRITON
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -29,8 +33,19 @@ class DSAPagedMQALogitsBackend(Enum):
                 )
             return DSAPagedMQALogitsBackend.AITER
 
-        if value == "auto" or value == "deepgemm":
+        if value == "auto":
+            # DeepGEMM's fp8 paged MQA logits kernels are Hopper+ only; fall back
+            # to the Triton implementation on Ampere (SM80) and other pre-SM90
+            # CUDA devices where DeepGEMM raises "Unsupported architecture".
+            return (
+                DSAPagedMQALogitsBackend.DEEPGEMM
+                if is_sm90_supported()
+                else DSAPagedMQALogitsBackend.TRITON
+            )
+        if value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
+        if value == "triton":
+            return DSAPagedMQALogitsBackend.TRITON
         if value == "aiter":
             raise ValueError("dsa_paged_mqa_logits_backend='aiter' requires ROCm.")
         if value == "cutedsl":

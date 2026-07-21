@@ -381,6 +381,16 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        # On Ampere (SM80) the indexer uses the Triton paged-MQA-logits kernel,
+        # which builds its own grid and needs no DeepGEMM schedule metadata
+        # (get_paged_mqa_logits_metadata raises "Unsupported architecture" there).
+        from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+            DSAPagedMQALogitsBackend,
+        )
+
+        self.paged_mqa_logits_use_triton = DSAPagedMQALogitsBackend.resolve(
+            model_runner.server_args.dsa_paged_mqa_logits_backend
+        ).is_triton()
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -628,6 +638,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if self.paged_mqa_logits_use_triton:
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -973,9 +985,10 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.paged_mqa_logits_use_triton:
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1311,9 +1324,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.paged_mqa_logits_use_triton:
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
