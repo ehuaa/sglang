@@ -732,4 +732,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=True,
             finalize_tree_path=False,
+            pp_enabled=self.server_args.pp_size > 1,
+            # Multi-layer eagle is single-stage and not deployed under PP;
+            # pp_is_last_rank=True disables the non-last-rank early return.
+            pp_is_last_rank=True,
         )
