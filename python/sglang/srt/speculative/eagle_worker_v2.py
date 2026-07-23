@@ -1227,6 +1227,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                self.device,
             )
         elif self._pp_enabled:
             # if pp enabled, the verifyInput should be built from
