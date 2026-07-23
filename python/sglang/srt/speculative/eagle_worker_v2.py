@@ -1267,7 +1267,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
-                    verify_input, _, _ = self.draft_worker.draft(batch)
+                    verify_input = self.draft_worker.draft(batch)
 
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
