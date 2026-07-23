@@ -135,7 +135,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Under pipeline parallelism the draft worker lives on a single PP
         # rank (the last one); only that rank's target pool needs to reserve
         # draft KV. Matches DSV4PoolConfigurator's (pp_size==1 or is_last_rank).
-        if kvc.pp_size == 1 or kvc.pp_group.is_last_rank:
+        if kvc.ps.pp_size == 1 or kvc.pp_group.is_last_rank:
             # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
             # Assumes draft and target share the same per-layer KV size (head_dim,
             # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
