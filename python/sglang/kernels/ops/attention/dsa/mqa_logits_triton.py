@@ -25,6 +25,16 @@ _PAGED_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
 
+# Grid axis 1 of the paged decode kernel. Each of the NUM_SPLITS programs per
+# query token walks the token's context pages with stride NUM_SPLITS, so the
+# grid stays static (CUDA-graph safe) without scaling with the block-table
+# width. The former per-(token, page) grid dispatched one program per possible
+# page (block_tables width ~16k for a 1M-token pool) and early-exited ~99% of
+# them past context_len; at B*next_n=24, ctx 2816, that empty dispatch made the
+# kernel 311us vs 58us for the strided walk (A100 SM80), and it scaled with
+# batch (B*next_n=96: 1229us vs 65us).
+_PAGED_NUM_SPLITS = 64
+
 # Prefill kernel adds BLOCK_N as a free tile axis. num_warps=8 was 1.5-3x
 # worse than {2,4} across the sweep; keep BLOCK_N in {32, 64, 128} so autotune
 # can pick per shape (BN=128 wins for GLM-5.1 long chunks).
@@ -98,25 +108,20 @@ def _fp8_paged_mqa_logits_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    block_rk = tl.program_id(1)
+    split_id = tl.program_id(1)
 
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
     context_len = tl.load(context_lens_ptr + batch_id)
-    if block_rk * block_size >= context_len:
-        return
-
+    num_ctx_blocks = tl.cdiv(context_len, block_size)
     q_offset = context_len - next_n + next_n_id
-
-    block_idx = tl.load(
-        block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k
-    )
 
     offs_h = tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, BLOCK_D)
@@ -132,40 +137,46 @@ def _fp8_paged_mqa_logits_kernel(
         other=0,
     )
     q = _decode_e4m3fn_bf16_lut(q_byte, fp8_lut_ptr)
-
-    kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
-    k_byte = tl.load(
-        kvf_base + offs_n[:, None] * stride_kvf_s + offs_d[None, :] * stride_kvf_d,
-        mask=mask_n[:, None] & mask_d[None, :],
-        other=0,
-    )
-    kvs_base = kv_scale_ptr + block_idx * stride_kvs_block
-    k_scale = tl.load(
-        kvs_base + offs_n * stride_kvs_s,
-        mask=mask_n,
-        other=0.0,
-    )
-    k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
-    # Scale in fp32 after the dot to avoid an extra bf16 round-trip on K.
-    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
-
     w = tl.load(
         weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
         mask=mask_h,
         other=0.0,
     )
-    s = tl.where(s > 0, s, 0.0) * w[:, None]
-    out = tl.sum(s, axis=0)
 
-    k_offset = block_rk * block_size + offs_n
-    valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
-    out = tl.where(valid, out, float("-inf"))
+    for block_rk in tl.range(split_id, num_ctx_blocks, NUM_SPLITS):
+        block_idx = tl.load(
+            block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k
+        )
+        kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
+        k_byte = tl.load(
+            kvf_base
+            + offs_n[:, None] * stride_kvf_s
+            + offs_d[None, :] * stride_kvf_d,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0,
+        )
+        kvs_base = kv_scale_ptr + block_idx * stride_kvs_block
+        k_scale = tl.load(
+            kvs_base + offs_n * stride_kvs_s,
+            mask=mask_n,
+            other=0.0,
+        )
+        k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
+        # Scale in fp32 after the dot to avoid an extra bf16 round-trip on K.
+        s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
 
-    tl.store(
-        logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
-        out,
-        mask=mask_n,
-    )
+        s = tl.where(s > 0, s, 0.0) * w[:, None]
+        out = tl.sum(s, axis=0)
+
+        k_offset = block_rk * block_size + offs_n
+        valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
+        out = tl.where(valid, out, float("-inf"))
+
+        tl.store(
+            logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+            out,
+            mask=mask_n,
+        )
 
 
 def fp8_paged_mqa_logits_triton(
@@ -186,7 +197,7 @@ def fp8_paged_mqa_logits_triton(
         context_lens:  [B] int32
         block_tables:  [B, max_blocks] int32
         max_model_len: output width. Caller passes the active batch max so
-            the logits buffer and grid stay tight.
+            the logits buffer stays tight.
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[:context_len]` per row).
     Returns:
@@ -228,7 +239,7 @@ def fp8_paged_mqa_logits_triton(
     BLOCK_N = triton.next_power_of_2(block_size)
 
     fp8_lut = _get_e4m3fn_bf16_lut(q.device)
-    grid = (B * next_n, block_tables.shape[1])
+    grid = (B * next_n, _PAGED_NUM_SPLITS)
     _fp8_paged_mqa_logits_kernel[grid](
         q_byte,
         kv_byte,
@@ -257,6 +268,7 @@ def fp8_paged_mqa_logits_triton(
         num_heads=num_heads,
         head_dim=head_dim,
         block_size=block_size,
+        NUM_SPLITS=_PAGED_NUM_SPLITS,
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,

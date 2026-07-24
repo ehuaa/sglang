@@ -20,9 +20,6 @@ LOG2E = 1.4426950408889634
 LOGE2 = 0.6931471805599453
 
 
-def num_compute_units(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
 # DeepSeek-V3.2 / GLM-5 sparse MLA shape constants.
 _BLOCK_DMODEL = 512
 _BLOCK_DPE = 64
@@ -30,7 +27,7 @@ _BLOCK_DV = 512
 _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
 
 _BLOCK_H = 16
-# Smallest BLOCK_N the autotune sweep offers; only used for the topk-divisibility
+# Smallest BLOCK_N the dispatch table offers; only used for the topk-divisibility
 # check at dispatch time.
 _MIN_BLOCK_N = 16
 
@@ -41,22 +38,13 @@ _MERGE_BLOCK_DV_TILE = 128
 assert _BLOCK_DV % _MERGE_BLOCK_DV_TILE == 0
 _NUM_MERGE_DV_TILES = _BLOCK_DV // _MERGE_BLOCK_DV_TILE
 
-# Final (prefill) and split (decode) kernels each tune to their own regime.
-_FINAL_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": 16}, num_warps=nw, num_stages=ns)
-    for nw in (2, 4)
-    for ns in (2, 4)
-]
-_SPLIT_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=ns) for ns in (2, 4)
-]
-
-# Split-count candidates for `_choose_num_kv_splits`; also the set pre-compiled
-# by `_warmup_autotune`.
-KV_SPLITS_CANDIDATES = (1, 2, 4, 8, 16)
-
-_MIN_TOPK_PER_SPLIT = 128  # below this, per-split work is too small to amortize
-_SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
+# Launch configs come from a measured decode sweep on A100 (108 SMs), GLM-5.2
+# shapes (h_q=64, dim_qk=576, topk=2048); ctx 2.8k and 16k picked the same
+# winners, all at num_warps=4 / num_stages=2. `_choose_config` holds the
+# per-shape winner table. Explicit configs (no @triton.autotune) keep dispatch
+# deterministic and avoid inline sweeps during CUDA-graph warmup.
+_NUM_WARPS = 4
+_NUM_STAGES = 2
 
 
 @triton.jit
@@ -170,7 +158,6 @@ def _sparse_mla_compute_tile(
     return acc, e_max, e_sum
 
 
-@triton.autotune(configs=_FINAL_AUTOTUNE_CONFIGS, key=["index_topk", "kv_group_num"])
 @triton.jit
 def _sparse_mla_kernel_final(
     q_buffer,
@@ -243,10 +230,6 @@ def _sparse_mla_kernel_final(
     )
 
 
-@triton.autotune(
-    configs=_SPLIT_AUTOTUNE_CONFIGS,
-    key=["index_topk", "NUM_KV_SPLITS", "kv_group_num"],
-)
 @triton.jit
 def _sparse_mla_kernel_split(
     q_buffer,
@@ -418,23 +401,36 @@ def _sparse_mla_merge_kernel(
 
 
 @functools.lru_cache(maxsize=256)
-def _choose_num_kv_splits(
-    num_tokens: int, num_head_groups: int, index_topk: int, sm_count: int
-) -> int:
-    """Pick a power-of-2 split count that fills the device without dropping
-    per-split work below _MIN_TOPK_PER_SPLIT. Returns 1 when the single-pass
-    grid already reaches ~1/_SPLIT_MAX_OCCUPANCY utilization.
+def _choose_config(
+    num_tokens: int, h_q: int, index_topk: int
+) -> tuple[int, int, int]:
+    """Pick `(num_kv_splits, block_h, block_n)`; splits == 1 selects the
+    single-pass final kernel.
+
+    Winner table from the A100 sweep, in `units = num_tokens * cdiv(h_q, 16)`
+    (the BH=16 single-pass grid size; 108 SMs). Per-unit timings at h_q=64 vs
+    the previous auto dispatch:
+      units<=16  : split x4, BN=32   (nt<=4:  67-72us vs 89us)
+      units<=48  : split x2, BN=64   (nt<=12: 86-103us vs 258-262us)
+      units<=80  : split x4, BN=64   (nt<=16: ~150us vs 270us)
+      units<=112 : final BH=16 BN=64 (nt<=24: 184us vs 290us)
+      else       : final BH=32 BN=32 (nt>=32: 236-773us vs 399-1278us;
+                   BH=32 halves the per-head-group re-read of the topk KV)
     """
-    baseline = num_tokens * num_head_groups
-    if baseline == 0 or baseline * _SPLIT_MAX_OCCUPANCY >= sm_count:
-        return 1
-    ideal = triton.next_power_of_2(max(1, index_topk // _MIN_TOPK_PER_SPLIT))
-    max_splits = max(1, sm_count // baseline)
-    max_splits = 1 << (max_splits.bit_length() - 1)  # floor to power of 2
-    num_kv_splits = min(ideal, max_splits)
-    while num_kv_splits > 1 and index_topk % num_kv_splits != 0:
-        num_kv_splits //= 2
-    return max(1, num_kv_splits)
+    units = num_tokens * triton.cdiv(h_q, _BLOCK_H)
+    if units <= 16:
+        splits, block_h, block_n = 4, _BLOCK_H, 32
+    elif units <= 48:
+        splits, block_h, block_n = 2, _BLOCK_H, 64
+    elif units <= 80:
+        splits, block_h, block_n = 4, _BLOCK_H, 64
+    elif units <= 112 or h_q < 32:
+        splits, block_h, block_n = 1, _BLOCK_H, 64
+    else:
+        splits, block_h, block_n = 1, 32, 32
+    while splits > 1 and index_topk % splits != 0:
+        splits //= 2
+    return splits, block_h, block_n
 
 
 def triton_mla_sparse_attention(
@@ -453,7 +449,7 @@ def triton_mla_sparse_attention(
         indices:   [num_tokens, num_heads_kv=1, topk] int32
         sm_scale:  softmax scale
         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
-        sm_count:  cached device SM count for the split heuristic.
+        sm_count:  unused; retained for call-site compatibility.
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
@@ -466,19 +462,20 @@ def triton_mla_sparse_attention(
     assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
     index_topk = indices.shape[2]
     assert index_topk % _MIN_BLOCK_N == 0, (
-        f"topk ({index_topk}) must be a multiple of the smallest autotune "
+        f"topk ({index_topk}) must be a multiple of the smallest dispatch "
         f"BLOCK_N ({_MIN_BLOCK_N})"
     )
 
     kv_group_num = num_heads_q
-    num_head_groups = triton.cdiv(num_heads_q, min(_BLOCK_H, kv_group_num))
 
     if num_kv_splits is None or num_kv_splits == 0:
-        if sm_count is None:
-            sm_count = num_compute_units(q.device.index)
-        num_kv_splits = _choose_num_kv_splits(
-            num_tokens, num_head_groups, index_topk, sm_count
+        num_kv_splits, block_h, block_n = _choose_config(
+            num_tokens, num_heads_q, index_topk
         )
+    else:
+        # Manual override (bench/debug): generic tile for either path.
+        block_h, block_n = _BLOCK_H, 64
+    num_head_groups = triton.cdiv(num_heads_q, min(block_h, num_heads_q))
 
     out = torch.empty(
         (num_tokens, num_heads_q, _BLOCK_DV),
@@ -505,10 +502,13 @@ def triton_mla_sparse_attention(
             sm_scale=sm_scale * LOG2E,
             index_topk=index_topk,
             kv_group_num=kv_group_num,
-            BLOCK_H=_BLOCK_H,
+            BLOCK_H=block_h,
+            BLOCK_N=block_n,
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=_BLOCK_DPE,
+            num_warps=_NUM_WARPS,
+            num_stages=_NUM_STAGES,
         )
         return out
 
@@ -538,11 +538,14 @@ def triton_mla_sparse_attention(
         index_topk=index_topk,
         NUM_KV_SPLITS=num_kv_splits,
         kv_group_num=kv_group_num,
-        BLOCK_H=_BLOCK_H,
+        BLOCK_H=block_h,
+        BLOCK_N=block_n,
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DMODEL=_BLOCK_DMODEL,
         BLOCK_DPE=_BLOCK_DPE,
         LOGE2=LOGE2,
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
     )
 
     _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](
