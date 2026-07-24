@@ -1214,6 +1214,23 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     import torch
 
     major, _ = torch.cuda.get_device_capability()
+
+    # The fused DeepSeek-V4 top-k v2 JIT kernel (gated by SGLANG_OPT_USE_TOPK_V2)
+    # uses Hopper thread-block clusters (__cluster_dims__ / cg::this_cluster) and
+    # cannot compile below SM90. Force it off on pre-Hopper GPUs so DSA top-k
+    # falls back to the sgl-kernel fused transform (fast_topk_transform_fused),
+    # the default sgl-kernel path -- no user flags needed. Without this, SM80
+    # requires a manual SGLANG_OPT_USE_TOPK_V2=0.
+    if major < 9 and envs.SGLANG_OPT_USE_TOPK_V2.get():
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+        logger.warning(
+            "Disabling SGLANG_OPT_USE_TOPK_V2 on pre-Hopper GPU (compute "
+            "capability %d.x < 9.0): the DeepSeek-V4 top-k v2 kernel needs "
+            "Hopper thread-block clusters; using the sgl-kernel fused top-k "
+            "transform instead.",
+            major,
+        )
+
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
