@@ -45,10 +45,26 @@ _PREFILL_AUTOTUNE_CONFIGS = [
     for ns in (2, 4)
 ]
 
-# Warmup shape mirrors the chunked-prefill regime (small M, long N) so
-# autotune picks a tile sized for real serving rather than a launch-overhead-
-# dominated dummy grid.
-_PREFILL_WARMUP_M = 8
+# Query tokens handled per prefill program. One program per query token (the
+# original shape) re-loaded the whole [BLOCK_N, head_dim] K tile for every
+# token: arithmetic intensity is 1/(1/BLOCK_N + 1/(BLOCK_M*num_heads)), so at
+# BLOCK_M=1 / num_heads=32 / BLOCK_N=128 it was 25.6 flop/byte against the ~156
+# an A100 needs to be compute-bound, and the kernel ran at 29% of bf16 peak with
+# an effective K bandwidth of 2.85 TB/s -- above HBM peak, i.e. L2 was absorbing
+# the re-reads and L2 bandwidth was the limit.
+#
+# Sweeping BLOCK_M on A100 at the real chunked-prefill shapes (M=4096, H=32,
+# D=128, N up to 32768) put the optimum at 16, worth ~1.6x: 8/32/64/128 all lose
+# (128 needs num_warps=8 and still only reaches 1.36x, because the fully
+# unrolled loop pushes registers 156 -> 191 and the grid gets too small to fill
+# the SMs). Capped by M at dispatch so short prefills don't run masked-off
+# iterations.
+_PREFILL_BLOCK_M = 16
+
+# Warmup shape mirrors the chunked-prefill regime so autotune picks a tile
+# sized for real serving. M matters now that the kernel tiles over it -- a
+# dummy M of 8 would leave a single program on the M axis and mis-rank BLOCK_N.
+_PREFILL_WARMUP_M = 4096
 _PREFILL_WARMUP_N = 8192
 
 
@@ -303,6 +319,8 @@ def _fp8_mqa_logits_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     N,
+    M,
+    BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -310,23 +328,28 @@ def _fp8_mqa_logits_kernel(
     # bf16 q/k inputs: the wrapper pre-decodes FP8 -> bf16. At compute-bound
     # prefill this is ~2x the in-kernel LUT (LUT lookups contend with the
     # matmul for ALU/regs). Paged-decode keeps the LUT path.
-    m = tl.program_id(0)
+    m_block = tl.program_id(0)
     n_block = tl.program_id(1)
 
     n_start = n_block * BLOCK_N
     offs_n = n_start + tl.arange(0, BLOCK_N)
     mask_n = offs_n < N
-    # Early-exit when this row's `[ks, ke)` range doesn't overlap the tile.
-    # Chunked prefill produces many such all-masked tiles per row.
-    ks = tl.load(ks_ptr + m)
-    ke = tl.load(ke_ptr + m)
-    if (n_start >= ke) | (n_start + BLOCK_N <= ks):
+
+    offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+    # Early-exit when no row in this block has its `[ks, ke)` range overlapping
+    # the tile. Chunked prefill produces many such all-masked tiles. Per-row
+    # masking still happens below; these bounds only need to be conservative,
+    # which the identity padding (+inf for ks, 0 for ke) keeps them.
+    ks_blk = tl.load(ks_ptr + offs_m, mask=mask_m, other=2147483647)
+    ke_blk = tl.load(ke_ptr + offs_m, mask=mask_m, other=0)
+    if (n_start >= tl.max(ke_blk)) | (n_start + BLOCK_N <= tl.min(ks_blk)):
         # When `clean_logits=False` the caller skipped the -inf pre-fill, so
         # write -inf here for the early-exit tile.
         tl.store(
-            logits_ptr + m * stride_l_m + offs_n * stride_l_n,
-            tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
-            mask=mask_n,
+            logits_ptr + offs_m[:, None] * stride_l_m + offs_n[None, :] * stride_l_n,
+            tl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=tl.float32),
+            mask=mask_m[:, None] & mask_n[None, :],
         )
         return
 
@@ -335,39 +358,50 @@ def _fp8_mqa_logits_kernel(
     mask_h = offs_h < num_heads
     mask_d = offs_d < head_dim
 
-    q = tl.load(
-        q_ptr
-        + m * stride_q_m
-        + offs_h[:, None] * stride_q_h
-        + offs_d[None, :] * stride_q_d,
-        mask=mask_h[:, None] & mask_d[None, :],
-        other=0.0,
-    )
-
+    # Loaded once and reused by every query token in this block -- that reuse is
+    # the whole point of tiling over M (see `_PREFILL_BLOCK_M`). The per-token
+    # intermediate deliberately stays [BLOCK_H, BLOCK_N]: a single
+    # [BLOCK_M * BLOCK_H, BLOCK_N] dot would be 128 KB of fp32 accumulator at
+    # BLOCK_M=16 and would spill.
     k = tl.load(
         k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
         mask=mask_n[:, None] & mask_d[None, :],
         other=0.0,
     )
+    kt = tl.trans(k)
     k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
-    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
 
-    w = tl.load(
-        weights_ptr + m * stride_w_m + offs_h * stride_w_h,
-        mask=mask_h,
-        other=0.0,
-    )
-    s = tl.where(s > 0, s, 0.0) * w[:, None]
-    out = tl.sum(s, axis=0)
+    for i in tl.static_range(BLOCK_M):
+        m = m_block * BLOCK_M + i
+        alive = m < M
+        q = tl.load(
+            q_ptr
+            + m * stride_q_m
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=(mask_h[:, None] & mask_d[None, :]) & alive,
+            other=0.0,
+        )
+        s = tl.dot(q, kt) * k_scale[None, :]
 
-    valid = mask_n & (offs_n >= ks) & (offs_n < ke)
-    out = tl.where(valid, out, float("-inf"))
+        w = tl.load(
+            weights_ptr + m * stride_w_m + offs_h * stride_w_h,
+            mask=mask_h & alive,
+            other=0.0,
+        )
+        s = tl.where(s > 0, s, 0.0) * w[:, None]
+        out = tl.sum(s, axis=0)
 
-    tl.store(
-        logits_ptr + m * stride_l_m + offs_n * stride_l_n,
-        out,
-        mask=mask_n,
-    )
+        ks = tl.load(ks_ptr + m, mask=alive, other=0)
+        ke = tl.load(ke_ptr + m, mask=alive, other=0)
+        valid = mask_n & (offs_n >= ks) & (offs_n < ke)
+        out = tl.where(valid, out, float("-inf"))
+
+        tl.store(
+            logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+            out,
+            mask=mask_n & alive,
+        )
 
 
 def fp8_mqa_logits_triton(
@@ -404,13 +438,19 @@ def fp8_mqa_logits_triton(
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
+    # The M loop is a `static_range`, so an oversized BLOCK_M costs masked-off
+    # iterations on short prefills (draft extend, tiny chunks). Cap it by M.
+    BLOCK_M = min(_PREFILL_BLOCK_M, triton.next_power_of_2(M))
 
     # Pre-decode FP8 -> bf16; the kernel runs a straight `tl.dot`.
     q_bf16 = q.to(torch.bfloat16)
     k_bf16 = k_fp8.to(torch.bfloat16)
 
     # Grid depends on the autotuned BLOCK_N.
-    grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, meta["BLOCK_N"]),
+    )
     _fp8_mqa_logits_kernel[grid](
         q_bf16,
         k_bf16,
@@ -431,6 +471,8 @@ def fp8_mqa_logits_triton(
         num_heads=num_heads,
         head_dim=head_dim,
         N=N,
+        M=M,
+        BLOCK_M=BLOCK_M,
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
     )
