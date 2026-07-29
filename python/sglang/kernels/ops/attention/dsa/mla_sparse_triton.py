@@ -38,13 +38,18 @@ _MERGE_BLOCK_DV_TILE = 128
 assert _BLOCK_DV % _MERGE_BLOCK_DV_TILE == 0
 _NUM_MERGE_DV_TILES = _BLOCK_DV // _MERGE_BLOCK_DV_TILE
 
-# Launch configs come from a measured decode sweep on A100 (108 SMs), GLM-5.2
-# shapes (h_q=64, dim_qk=576, topk=2048); ctx 2.8k and 16k picked the same
-# winners, all at num_warps=4 / num_stages=2. `_choose_config` holds the
-# per-shape winner table. Explicit configs (no @triton.autotune) keep dispatch
-# deterministic and avoid inline sweeps during CUDA-graph warmup.
+# Launch configs come from a measured A100 sweep over the decode, spec-verify
+# and prefill shapes at GLM-5.2 sizes (h_q=64, dim_qk=576, topk=2048).
+# `_choose_config` holds the winners; num_warps varies with BLOCK_H, so
+# `_NUM_WARPS` is only the default for the manual-override path. Explicit
+# configs (no @triton.autotune) keep dispatch deterministic and avoid inline
+# sweeps during CUDA-graph warmup.
 _NUM_WARPS = 4
 _NUM_STAGES = 2
+
+# A100. Only used to score wave quantization in `_choose_config`, which was
+# measured on this SM count.
+_SM_COUNT = 108
 
 
 @triton.jit
@@ -76,8 +81,6 @@ def _sparse_mla_compute_tile(
     `[split_start, split_end)` of the topk axis, return accumulators."""
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
 
     q = tl.load(
         q_buffer
@@ -92,7 +95,7 @@ def _sparse_mla_compute_tile(
         + cur_q * stride_q_token
         + cur_head[:, None] * stride_q_head
         + offs_dpe[None, :],
-        mask=(mask_h[:, None]) & (mask_dpe[None, :]),
+        mask=mask_h[:, None],
         other=0.0,
     )
 
@@ -117,41 +120,34 @@ def _sparse_mla_compute_tile(
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
 
-        offs_k = (
-            indices[None, :] * stride_kv_token
+        # ONE gather per tile. In the absorbed form V is exactly the first
+        # BLOCK_DV lanes of K, so the tile is loaded token-major and transposed
+        # in-register for the QK dot rather than gathered a second time
+        # D-major. The gather is scattered (by topk index), so issuing it twice
+        # doubled the HBM transactions, and holding both layouts doubled the
+        # shared-memory footprint -- at BLOCK_H=32/BLOCK_N=32 that was 108,672 B
+        # per CTA, over half of the A100's 164 KB, pinning the kernel to one
+        # CTA (4 warps) per SM. Measured 1.77x at the unchanged tile size, and
+        # it is what makes BLOCK_N=64 fit at all.
+        kv_base = (
+            k_buffer
+            + indices[:, None] * stride_kv_token
             + cur_kv_head_id * stride_kv_head
-            + offs_d[:, None]
         )
-        k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
-        qk = tl.dot(q, k.to(q.dtype))
+        kv = tl.load(kv_base + offs_d[None, :], mask=mask_kv[:, None], other=0.0)
+        kpe = tl.load(kv_base + offs_dpe[None, :], mask=mask_kv[:, None], other=0.0)
 
-        offs_kpe = (
-            indices[None, :] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dpe[:, None]
-        )
-        kpe = tl.load(
-            k_buffer + offs_kpe,
-            mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
-            other=0.0,
-        )
-        qk += tl.dot(qpe, kpe.to(q.dtype))
+        qk = tl.dot(q, tl.trans(kv).to(q.dtype))
+        qk += tl.dot(qpe, tl.trans(kpe).to(q.dtype))
 
         qk *= sm_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
-
-        offs_v = (
-            indices[:, None] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dv[None, :]
-        )
-        v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2(e_max - n_e_max)
         p = tl.exp2(qk - n_e_max[:, None])
         acc *= re_scale[:, None]
-        acc += tl.dot(p.to(v.dtype), v)
+        acc += tl.dot(p.to(kv.dtype), kv)
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
@@ -400,37 +396,56 @@ def _sparse_mla_merge_kernel(
     )
 
 
+def _wave_efficiency(grid: int, sm_count: int) -> float:
+    """Fraction of the launched waves' SM slots that carry work."""
+    return grid / (triton.cdiv(grid, sm_count) * sm_count)
+
+
 @functools.lru_cache(maxsize=256)
 def _choose_config(
     num_tokens: int, h_q: int, index_topk: int
-) -> tuple[int, int, int]:
-    """Pick `(num_kv_splits, block_h, block_n)`; splits == 1 selects the
-    single-pass final kernel.
+) -> tuple[int, int, int, int]:
+    """Pick `(num_kv_splits, block_h, block_n, num_warps)`; splits == 1 selects
+    the single-pass final kernel.
 
-    Winner table from the A100 sweep, in `units = num_tokens * cdiv(h_q, 16)`
-    (the BH=16 single-pass grid size; 108 SMs). Per-unit timings at h_q=64 vs
-    the previous auto dispatch:
-      units<=16  : split x4, BN=32   (nt<=4:  67-72us vs 89us)
-      units<=48  : split x2, BN=64   (nt<=12: 86-103us vs 258-262us)
-      units<=80  : split x4, BN=64   (nt<=16: ~150us vs 270us)
-      units<=112 : final BH=16 BN=64 (nt<=24: 184us vs 290us)
-      else       : final BH=32 BN=32 (nt>=32: 236-773us vs 399-1278us;
-                   BH=32 halves the per-head-group re-read of the topk KV)
+    Measured on A100 (108 SMs) at GLM-5.2 shapes (h_q=64, dim_qk=576,
+    topk=2048), in `units = num_tokens * cdiv(h_q, 16)`. Every tile here needs
+    more than half of the 164 KB shared-memory budget, so exactly one CTA lands
+    per SM and the grid size *is* the wave count.
+
+    Above the small-batch table the choice is BLOCK_H=32 vs BLOCK_H=64. The
+    grid is `num_tokens * cdiv(h_q, BLOCK_H)`, so BLOCK_H=64 halves it: that
+    halves the per-head-group re-read of the topk KV, but can leave a much
+    emptier tail wave. Wave efficiency decides, and reproduces all 11 measured
+    points -- BLOCK_H=64 wins at nt=64/96/192/384/512/768/1024/4096 and loses at
+    nt=48/128/256 (where its tail wave runs 44-79% full against 79-95%).
     """
     units = num_tokens * triton.cdiv(h_q, _BLOCK_H)
-    if units <= 16:
-        splits, block_h, block_n = 4, _BLOCK_H, 32
+    if units <= 8:
+        splits, block_h, block_n, warps = 8, _BLOCK_H, 64, 4
+    elif units <= 16:
+        splits, block_h, block_n, warps = 4, _BLOCK_H, 64, 4
     elif units <= 48:
-        splits, block_h, block_n = 2, _BLOCK_H, 64
-    elif units <= 80:
-        splits, block_h, block_n = 4, _BLOCK_H, 64
-    elif units <= 112 or h_q < 32:
-        splits, block_h, block_n = 1, _BLOCK_H, 64
+        splits, block_h, block_n, warps = 4, 32, 64, 4
+    elif units <= 128:
+        splits, block_h, block_n, warps = 4, 32, 32, 4
     else:
-        splits, block_h, block_n = 1, 32, 32
+        wide = _wave_efficiency(num_tokens * triton.cdiv(h_q, 64), _SM_COUNT)
+        narrow = _wave_efficiency(num_tokens * triton.cdiv(h_q, 32), _SM_COUNT)
+        if wide >= 0.9 * narrow:
+            # BLOCK_H=64 requires num_warps=8: at 4 warps ptxas spills ~136
+            # slots and the build runs ~1.7x slower.
+            splits, block_h, block_n, warps = 1, 64, 64, 8
+        else:
+            splits, block_h, block_n, warps = 1, 32, 64, 4
+
+    # A BLOCK_H wider than h_q only masks lanes off; drop to the largest tile
+    # that carries real heads (and back to the 4-warp build with it).
+    if block_h > h_q:
+        block_h, warps = max(_BLOCK_H, h_q), _NUM_WARPS
     while splits > 1 and index_topk % splits != 0:
         splits //= 2
-    return splits, block_h, block_n
+    return splits, block_h, block_n, warps
 
 
 def triton_mla_sparse_attention(
@@ -469,12 +484,12 @@ def triton_mla_sparse_attention(
     kv_group_num = num_heads_q
 
     if num_kv_splits is None or num_kv_splits == 0:
-        num_kv_splits, block_h, block_n = _choose_config(
+        num_kv_splits, block_h, block_n, num_warps = _choose_config(
             num_tokens, num_heads_q, index_topk
         )
     else:
         # Manual override (bench/debug): generic tile for either path.
-        block_h, block_n = _BLOCK_H, 64
+        block_h, block_n, num_warps = _BLOCK_H, 64, _NUM_WARPS
     num_head_groups = triton.cdiv(num_heads_q, min(block_h, num_heads_q))
 
     out = torch.empty(
@@ -507,7 +522,7 @@ def triton_mla_sparse_attention(
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=_BLOCK_DPE,
-            num_warps=_NUM_WARPS,
+            num_warps=num_warps,
             num_stages=_NUM_STAGES,
         )
         return out
@@ -544,7 +559,7 @@ def triton_mla_sparse_attention(
         BLOCK_DMODEL=_BLOCK_DMODEL,
         BLOCK_DPE=_BLOCK_DPE,
         LOGE2=LOGE2,
-        num_warps=_NUM_WARPS,
+        num_warps=num_warps,
         num_stages=_NUM_STAGES,
     )
 
