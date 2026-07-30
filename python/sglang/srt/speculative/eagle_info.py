@@ -474,8 +474,17 @@ class EaglePPVerifyInputRaw(SpecInput):
         )
 
     def filter_batch(
-        self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
     ):
+        # `has_been_filtered` is part of the SpecInput.filter_batch contract in
+        # this tree -- ScheduleBatch.filter_batch always passes it by keyword --
+        # and #31139 was written against an upstream main whose signature had
+        # dropped it. It is accepted and ignored here: these are plain per-request
+        # Python lists relayed from the last PP rank, so unlike EagleDraftInput
+        # they are never pre-filtered by verify() and always need indexing.
         idx = new_indices.tolist()
 
         def pick(lst):
