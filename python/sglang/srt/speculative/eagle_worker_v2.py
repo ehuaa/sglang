@@ -1223,19 +1223,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ):
-        # Under PP + DP attention, a rank with no local requests must still run
-        # in lockstep with the DP peers that are prefilling. On a global prefill
-        # step (some peer is extending, so the dp-attn all-gather sets
+        # Under DP attention, a rank with no local requests must still run in
+        # lockstep with the DP peers that are prefilling. On a global prefill
+        # step (some peer is extending, so the dp-attn all-gather set
         # is_extend_in_batch) the idle batch has to follow the *prefill* path so
         # every DP rank emits the same MoE cross-DP collective sequence (target
         # forward + a single draft_extend). Falling into the verify path below
         # would add speculative_num_steps extra draft-decode collectives on the
-        # idle rank and desync the MoE all-gather -> hang. _draft_extend_for_prefill
-        # already short-circuits its input_ids build for idle batches.
+        # idle rank and desync the MoE all-gather -> hang; one request arriving
+        # while the peers are idle is enough. This mirrors the globally
+        # synchronized is_extend_in_batch lockstep the scheduler already uses for
+        # its overlap decision (see is_disable_overlap_for_batch), and matches
+        # how the other spec workers spell it (`is_extend() or is_extend_in_batch`
+        # in multi_layer_eagle, frozen_kv_mtp, dflash, dspark).
+        #
+        # This is the is_extend_in_batch=1 half of the lockstep; the
+        # is_extend_in_batch=0 half -- idle rank while the peers *decode* -- is
+        # handled further down by letting an idle batch run the draft loop
+        # instead of short-cutting to EagleVerifyInput.create_idle_input. Both
+        # halves are needed: fixing either alone still deadlocks, because a run
+        # hits whichever case comes first.
         run_as_prefill = batch.forward_mode.is_extend() or (
-            self._pp_enabled
-            and batch.forward_mode.is_idle()
-            and batch.is_extend_in_batch
+            batch.forward_mode.is_idle() and batch.is_extend_in_batch
         )
         if run_as_prefill:
             # Target prefill. Only the last PP rank needs to capture hidden
@@ -1285,18 +1294,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
         # Decode
-        if batch.forward_mode.is_idle():
-            verify_input = EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-        elif self._pp_enabled:
-            # Under PP the verify input is built from the raw draft tree relayed
-            # from the last PP rank of the previous iteration.
-            verify_input = self._build_verify_input_from_pp_raw(batch)
+        if self._pp_enabled:
+            if batch.forward_mode.is_idle():
+                verify_input = EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+            else:
+                # the verifyInput should be built from the verifyInputRaw
+                verify_input = self._build_verify_input_from_pp_raw(batch)
         else:
+            # An idle batch falls through to the draft loop below instead of
+            # short-cutting to EagleVerifyInput.create_idle_input. Under DP
+            # attention a rank goes idle as soon as its own requests finish,
+            # which happens on different steps than its peers' because accept
+            # lengths differ; short-cutting would skip speculative_num_steps
+            # draft forwards, so that rank issues that many fewer cross-DP MoE
+            # collectives than the peers still decoding and the run deadlocks
+            # (traced: all 16 ranks agreed for 1181 collectives, then the idle
+            # ranks jumped straight into the 78-layer verify while the decoding
+            # ranks ran 4 one-token draft steps). `batch.spec_info` is None for
+            # an idle batch, so the create_idle_input branch below supplies the
+            # empty draft input and `draft()` emits the same collectives as the
+            # peers. This is what multi_layer_eagle_worker_v2 already does --
+            # it has no is_idle() special case at all.
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
