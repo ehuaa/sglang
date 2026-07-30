@@ -653,11 +653,6 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        from sglang.srt.speculative.dspark_components.dspark_verify import (
-            DSparkPPVerifyInputRaw,
-        )
-        from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
-
         if result.copy_done is not None:
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -692,24 +687,6 @@ class SchedulerBatchResultProcessor:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
             )
-
-        # PP speculative decode: move accepted tokens' KV to contiguous slots
-        # before freeing. Runs on every PP rank.
-        if isinstance(
-            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
-        ):
-            pp_raw = batch.spec_info
-            accept_lens_cpu = torch.tensor(pp_raw.accept_lens, dtype=torch.int64)
-            accept_lens = accept_lens_cpu.to(batch.seq_lens.device)
-            if pp_raw.accept_index is not None:
-                accept_index = torch.tensor(
-                    pp_raw.accept_index,
-                    dtype=torch.long,
-                    device=batch.seq_lens.device,
-                )
-                self.model_worker.move_accept_tokens_to_target_kvcache(
-                    batch, accept_index, accept_lens - 1
-                )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -773,16 +750,6 @@ class SchedulerBatchResultProcessor:
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
-
-        # PP speculative decode: advance seq_lens to post-iter (accept_lens added
-        # per req).
-        if isinstance(
-            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
-        ):
-            batch.seq_lens = batch.seq_lens + accept_lens
-            if batch.seq_lens_cpu is not None:
-                batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
-            batch.seq_lens_sum = None
 
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1

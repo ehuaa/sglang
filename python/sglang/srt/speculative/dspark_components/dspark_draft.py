@@ -348,10 +348,9 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
+        prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
-
-        prefix_lens = positions_2d[:, 0]
 
         draft_block_ids = torch.full(
             (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
@@ -366,9 +365,8 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        # Keep the CPU copy consistent with the window-derived prefix_lens.
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = prefix_lens.to("cpu", dtype=torch.int64) + gamma
+            draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:
             draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu

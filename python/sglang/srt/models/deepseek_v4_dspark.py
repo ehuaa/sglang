@@ -10,9 +10,7 @@ from torch import nn
 
 from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -632,16 +630,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
 
-        # PP group of the hosting (last) rank. Under PP the target embed_tokens
-        # on the last rank is a PPMissingLayer shell, so the draft must load its
-        # own embed_tokens. Under non-PP the draft-built embed is later replaced
-        # by the shared target embed (see attach_shared_modules).
-        self.pp_group = get_pp_group()
-        self.embed_tokens: nn.Module = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
-        )
+        self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
@@ -651,23 +640,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return self.confidence_head is not None
 
     def attach_shared_modules(
-        self,
-        *,
-        embed_tokens: Optional[nn.Module],
-        lm_head: nn.Module,
+        self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        # lm_head is always shared from the target (real ParallelLMHead with
-        # shard attributes on every supported path).
+        self.embed_tokens = embed_tokens
         self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=lm_head)
-        if embed_tokens is not None:
-            # Non-PP: replace the draft-built embed with the shared target embed
-            # and release the draft-built weight to avoid holding two copies.
-            del self.embed_tokens
-            self.embed_tokens = embed_tokens
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        # PP (embed_tokens is None): keep the draft self-loaded embed_tokens.
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
@@ -878,17 +855,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
-        # lm_head is always shared from the target model (the last-rank target
-        # lm_head is a real ParallelLMHead with valid shard attributes).
-        if name.startswith(("head.", "lm_head.")):
-            return None
-        # Under PP the last-rank target embed_tokens is a PPMissingLayer shell,
-        # so the draft loads its own embed weight (param key "embed_tokens.weight"
-        # for the flat draft structure). Under non-PP embed is shared from the
-        # target, so skip loading here.
-        if name.startswith(("embed.", "embed_tokens.")):
-            if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
-                return "embed_tokens.weight"
+        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
         if "rotary_emb.inv_freq" in name:
             return None

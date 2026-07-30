@@ -62,10 +62,6 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
-    # PP non-last rank: draft model only runs on last rank
-    if server_args.pp_size > 1 and not draft_worker._pp_is_last_rank:
-        return None
-
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
