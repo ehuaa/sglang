@@ -447,7 +447,9 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        # Perform only one Device-to-Host (D2H) memory copy
+        # `MLPSyncBatchInfo.all_gather` already brought the info rows to the host
+        # in a single D2H, so this `.cpu()` is a no-op. Keep it that way: passing
+        # a device tensor in here reintroduces a per-step stream sync.
         cpu_data = partial_global_info[:, :2].cpu()
         local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
         forward_modes = cpu_data[:, 1].tolist()

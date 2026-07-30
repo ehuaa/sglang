@@ -36,6 +36,35 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+# Pinned staging for the [local, fallback] MLP-sync info rows. A CUDA tensor
+# built straight from a Python list (`torch.tensor([...], device="cuda")`) is a
+# *blocking* pageable H2D: it drains the current stream, so the scheduler stalls
+# behind the entire previous forward before it can even issue the sync
+# collective. Copying out of pinned memory keeps the H2D async, and the two rows
+# travel in one transfer instead of two.
+_mlp_sync_h2d_staging: Optional[torch.Tensor] = None
+
+
+def _mlp_sync_info_to_device(
+    rows: list[list[int]], device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Move the [local, fallback] info rows to ``device`` in one transfer."""
+    global _mlp_sync_h2d_staging
+
+    host_rows = torch.tensor(rows, dtype=dtype)
+    if torch.device(device).type == "cpu":
+        return host_rows
+    if (
+        _mlp_sync_h2d_staging is None
+        or _mlp_sync_h2d_staging.dtype != dtype
+        or _mlp_sync_h2d_staging.shape != host_rows.shape
+    ):
+        _mlp_sync_h2d_staging = torch.empty_like(host_rows, pin_memory=True)
+    _mlp_sync_h2d_staging.copy_(host_rows)
+    # Reusing the staging buffer next step is safe: the single D2H at the end of
+    # `all_gather` syncs the stream, so this copy has long since completed.
+    return _mlp_sync_h2d_staging.to(device, non_blocking=True)
+
 
 def _resolve_elastic_world_dp_size(
     dp_size: int,
@@ -96,8 +125,10 @@ class MLPSyncBatchInfo:
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
-    def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
+    def _info_rows(self) -> list[list[int]]:
+        """The local info row, followed by the fallback row that inactive slots
+        take (they must decode as IDLE)."""
+        return [
             [
                 self.num_tokens,
                 self.num_tokens_for_logprob,
@@ -107,12 +138,6 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_breakable_cuda_graph),
             ],
-            device=device,
-            dtype=dtype,
-        )
-
-    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
             [
                 0,  # num_tokens
                 0,  # num_tokens_for_logprob
@@ -122,9 +147,7 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_breakable_cuda_graph
             ],
-            device=device,
-            dtype=dtype,
-        )
+        ]
 
     def all_gather(
         self,
@@ -132,8 +155,10 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
-        local_info_tensor = self._get_local_tensor(device=device)
-        fallback_tensor = self._get_fallback_tensor(device=device)
+        info_pair = _mlp_sync_info_to_device(
+            self._info_rows(), device=device, dtype=torch.int64
+        )
+        local_info_tensor, fallback_tensor = info_pair[0], info_pair[1]
         info_width = local_info_tensor.numel()
         # Inactive max_world_size slots must decode as IDLE.
         global_info_tensor = fallback_tensor.expand(
@@ -177,12 +202,17 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        tp0_info = global_info_tensor[:, 0, :]
+        # One D2H for the whole tp0 slice, and every field below (plus the
+        # downstream `tp0_info` readers in `prepare_mlp_sync_batch_raw` and
+        # `TboDPAttentionPreparer.compute_output`) is read off the host copy.
+        # Slicing per field instead cost six separate `.cpu()` / `.item()` /
+        # `.tolist()` syncs, each stalling the scheduler on the stream.
+        # `.contiguous()` first: the tp0 slice strides over the tp axis, and a
+        # strided cross-device copy is not guaranteed to be a single transfer.
+        tp0_info = global_info_tensor[:, 0, :].contiguous().cpu()
         self.tp0_info = tp0_info
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
-        self.global_num_tokens = cpu_data[:, 0].tolist()
-        self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        self.global_num_tokens = tp0_info[:, 0].tolist()
+        self.global_num_tokens_for_logprob = tp0_info[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
