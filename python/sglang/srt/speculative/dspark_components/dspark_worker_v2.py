@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
     InfoSegment,
 )
+from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
     alloc_verify_window,
@@ -229,6 +230,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             self._draft_block_spec_info = None
 
+        parallel = get_parallel()
+        self._tp_sync = DsparkTpSync(
+            parallel.attn_tp_group
+            if server_args.enable_dp_attention
+            else parallel.tp_group
+        )
+
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -267,6 +275,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 gamma=self.gamma,
                 mask_token_id=self._mask_token_id,
                 draft_block_spec_info=self._draft_block_spec_info,
+                tp_sync=self._tp_sync,
                 dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
             )
         else:
