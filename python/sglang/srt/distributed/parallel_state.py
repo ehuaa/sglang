@@ -213,6 +213,15 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+# Sentinel for GroupCoordinator._sm80_p2p: the symmetric buffer can only be
+# allocated and rendezvoused outside CUDA-graph capture, so the build is
+# deferred to the first eligible eager collective.
+_SM80_P2P_UNBUILT = object()
+# Per-rank shard ceiling the symmetric buffer is sized for; matches the
+# module's own _MAX_BYTES_PER_RANK cutoff, above which NCCL is faster anyway.
+_SM80_P2P_MAX_BYTES = 1 << 20
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -388,6 +397,17 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
+        # Symmetric-memory P2P collectives, built on first eligible eager call
+        # and shared by the all-gather and reduce-scatter paths.
+        # _SM80_P2P_UNBUILT means "not attempted yet"; None means this group can
+        # never use them (cross-node, no symm-mem, or multicast available).
+        self._sm80_p2p_ag_enabled = envs.SGLANG_OPT_USE_SM80_P2P_ALLGATHER.get()
+        self._sm80_p2p_rs_enabled = envs.SGLANG_OPT_USE_SM80_P2P_REDUCE_SCATTER.get()
+        self._sm80_p2p = (
+            _SM80_P2P_UNBUILT
+            if (self._sm80_p2p_ag_enabled or self._sm80_p2p_rs_enabled)
+            else None
+        )
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -883,6 +903,8 @@ class GroupCoordinator:
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
+        elif self._maybe_sm80_p2p_reduce_scatter(output, input):
+            return
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -981,7 +1003,10 @@ class GroupCoordinator:
             else:
                 assert output.shape == output_shape
 
-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+            # Equal splits only; the guard rejects ragged `sizes`, for which
+            # pynccl issues world_size grouped ncclReduce calls instead.
+            if not self._maybe_sm80_p2p_reduce_scatter(output, input_):
+                pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -1050,9 +1075,67 @@ class GroupCoordinator:
             return envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
+    def _sm80_p2p_state(self):
+        """The shared symmetric-memory state, or None if unusable. Every rank of
+        the group reaches the same verdict: the build is collective and depends
+        only on replicated quantities."""
+        state = self._sm80_p2p
+        if state is _SM80_P2P_UNBUILT:
+            state = self._build_sm80_p2p()
+            if state is _SM80_P2P_UNBUILT:
+                return None  # under capture; retry on a later eager call
+            self._sm80_p2p = state
+        return state
+
+    def _maybe_sm80_p2p_all_gather(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> bool:
+        """Serve this all-gather from symmetric memory, or report False so the
+        caller falls back to NCCL."""
+        if not self._sm80_p2p_ag_enabled:
+            return False
+        state = self._sm80_p2p_state()
+        if state is None or not state.accepts_all_gather(output, input):
+            return False
+        state.all_gather(output, input)
+        return True
+
+    def _maybe_sm80_p2p_reduce_scatter(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> bool:
+        """Serve this reduce-scatter from symmetric memory, or report False so
+        the caller falls back to NCCL. Sum only, which is all sglang asks for."""
+        if not self._sm80_p2p_rs_enabled:
+            return False
+        state = self._sm80_p2p_state()
+        if state is None or not state.accepts_reduce_scatter(output, input):
+            return False
+        state.reduce_scatter(output, input)
+        return True
+
+    def _build_sm80_p2p(self):
+        from sglang.srt.distributed.device_communicators.symm_mem_p2p_sm80 import (
+            try_build,
+        )
+
+        if self.world_size <= 1 or self.device_group is None:
+            return None
+        if not all(in_the_same_node_as(self.cpu_group, source_rank=0)):
+            logger.info(
+                "sm80 P2P collectives disabled for %s: group spans nodes",
+                self.unique_name,
+            )
+            return None
+        # Size the buffer from the largest shard this group may see, derived
+        # from the same replicated quantity on every rank.
+        max_bytes = _SM80_P2P_MAX_BYTES * self.world_size
+        return try_build(self.device_group, self.rank_in_group, max_bytes)
+
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._all_gather_into_tensor(output, input)
+        elif self._maybe_sm80_p2p_all_gather(output, input):
+            pass
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
             # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor

@@ -726,6 +726,16 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Route small intra-node all-gathers through a symmetric-memory P2P Triton
+    # kernel instead of the NCCL ring. Only helps where NVLink SHARP multicast
+    # is absent (pre-Hopper), and only below ~1 MB per rank -- it moves
+    # world_size times the bytes, so it trades bandwidth for one-hop latency.
+    SGLANG_OPT_USE_SM80_P2P_ALLGATHER = EnvBool(False)
+    # Same substrate for the dp-attention MoE combine. Higher ceiling than the
+    # all-gather above: pynccl's reduce_scatterv is world_size grouped
+    # ncclReduce calls on the LL protocol (2x bytes on the wire), measured near
+    # 51 GB/s on 8x A100, and only half its profiled time is rank skew.
+    SGLANG_OPT_USE_SM80_P2P_REDUCE_SCATTER = EnvBool(False)
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
