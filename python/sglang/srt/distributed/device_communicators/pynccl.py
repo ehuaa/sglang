@@ -26,6 +26,26 @@ from sglang.srt.utils.common import get_current_device_stream_fast
 logger = logging.getLogger(__name__)
 
 
+def _drop_equal_sizes(sizes: Optional[list[int]]) -> Optional[list[int]]:
+    """Return None when every split is the same size, so the caller takes the
+    single-collective path instead of the grouped one.
+
+    `all_gatherv` / `reduce_scatterv` exist for ragged splits, which NCCL has no
+    primitive for: they issue one ncclBroadcast / ncclReduce per root inside a
+    group. With equal splits that is world_size independent ring operations
+    where ncclAllGather / ncclReduceScatter would do one, and it is measurably
+    worse -- on 8x A100, a 288 KB-per-rank bf16 reduce-scatter costs 106 us
+    grouped vs 42 us as ncclReduceScatter.
+
+    Equal splits are not a corner case here: dp-attention's MoE combine passes
+    `sizes` on every layer of every forward, and under MAX_LEN padding (which is
+    what decode uses) those sizes are all identical.
+    """
+    if sizes is not None and len(set(sizes)) == 1:
+        return None
+    return sizes
+
+
 class PyNcclCommunicator:
 
     def __init__(
@@ -195,6 +215,7 @@ class PyNcclCommunicator:
         )
         stream = self._resolve_stream()
 
+        sizes = _drop_equal_sizes(sizes)
         if sizes is not None:
             split_offset = 0
 
@@ -267,6 +288,7 @@ class PyNcclCommunicator:
         )
         stream = self._resolve_stream()
 
+        sizes = _drop_equal_sizes(sizes)
         if sizes is not None:
             split_offset = 0
             self.nccl.ncclGroupStart()
