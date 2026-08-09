@@ -27,6 +27,7 @@ import logging
 import multiprocessing as mp
 import os
 import random
+import shutil
 import signal
 import subprocess
 import sys
@@ -1596,6 +1597,17 @@ def _set_envs_and_config(server_args: ServerArgs):
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+
+    # torch, flashinfer, deep_gemm and sgl_kernel all probe CUDA_HOME the same
+    # way -- env var, then `which nvcc`, then /usr/local/cuda. TileLang inserts
+    # one extra guess before that last fallback: the pip `nvidia-cuda-nvcc`
+    # wheel. So on an image where nvcc is not on PATH, TileLang alone compiles
+    # against that wheel's nvcc paired with whatever nvidia-cuda-runtime version
+    # happens to be installed, and a mismatched pair fails CCCL's compiler/
+    # header version check at JIT time. Pin the toolkit the rest of the stack is
+    # already using so every JIT backend agrees.
+    if shutil.which("nvcc") is None and os.path.exists("/usr/local/cuda/bin/nvcc"):
+        os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
