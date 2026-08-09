@@ -5871,6 +5871,15 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+            elif is_cuda() and get_device_sm() < 90:
+                # Ampere: DeepGEMM is disabled below SM90 (deep_gemm_wrapper's
+                # configurer never imports the module), yet the MHC prenorm
+                # calls deep_gemm.tf32_hc_prenorm_gemm unconditionally, so the
+                # flag has to come off or load raises NameError. The top-k v2
+                # JIT kernel declares __cluster_dims__, which nvcc rejects
+                # below SM90. Both then take their TileLang / v1 counterparts.
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
