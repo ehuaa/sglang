@@ -359,6 +359,314 @@ def _tiled_sparse_decode_kernel_mh(
     tl.store(LSE_ptr + bid * H + h_offs, lse, mask=h_mask)
 
 
+@triton.jit
+def _tiled_sparse_decode_kernel_split(
+    Q_ptr,
+    cache_i32_ptr,
+    cache_uint8_ptr,
+    cache_bf16_ptr,
+    indices_ptr,
+    topk_len_ptr,
+    O_ptr,
+    LSE_ptr,
+    sm_scale: tl.float32,
+    page_size: tl.int32,
+    page_bytes: tl.int64,
+    scale_section_off: tl.int64,
+    H: tl.int32,
+    topk: tl.int32,
+    topk_rounded: tl.int32,
+    has_topk_len: tl.constexpr,
+    stride_qb: tl.int32,
+    stride_qh: tl.int32,
+    stride_ob: tl.int32,
+    stride_oh: tl.int32,
+    stride_ib: tl.int32,
+    NOPE_PAD: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    NOPE_DIM_RT: tl.int32,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    LOOP_STAGES: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    """Grid is (B, ceil(H / BLOCK_H), NUM_SPLITS).
+
+    Same body as the single-pass kernel, but each program covers only its slice
+    of the topk axis and writes an un-merged (output, lse) pair. Decode grids
+    are tiny -- B is the batch and H/BLOCK_H is usually 1 -- so without
+    splitting the launch occupies a handful of the GPU's 108 SMs.
+    """
+    bid = tl.program_id(0)
+    hblk = tl.program_id(1)
+    split_id = tl.program_id(2)
+
+    h_offs = hblk * BLOCK_H + tl.arange(0, BLOCK_H)  # [BLOCK_H]
+    h_mask = h_offs < H
+
+    nope_offs = tl.arange(0, NOPE_PAD)
+    rope_offs = tl.arange(0, ROPE_DIM)
+
+    # ---- Q: [BLOCK_H, NOPE_PAD] / [BLOCK_H, ROPE_DIM] ----
+    # sm_scale is applied in fp32 after the dot rather than folded into q, which
+    # would round it in bf16 first.
+    q_base = bid * stride_qb
+    q_ptrs = Q_ptr + q_base + h_offs[:, None] * stride_qh
+    # KV is loaded as int32 (4 bytes at a time), which yields an interleaved
+    # layout grouped every 4 columns. Rather than de-interleave the KV, q is
+    # split the same way into 4 slices and the 4 dots are summed: a dot product
+    # does not care about the order of the contracted dimension, so applying the
+    # same permutation to both sides is exactly equivalent.
+    w_offs = tl.arange(0, NOPE_PAD // 4)  # [128]
+    q_n0 = tl.load(q_ptrs + (w_offs * 4 + 0)[None, :], mask=h_mask[:, None], other=0.0)
+    q_n1 = tl.load(q_ptrs + (w_offs * 4 + 1)[None, :], mask=h_mask[:, None], other=0.0)
+    q_n2 = tl.load(q_ptrs + (w_offs * 4 + 2)[None, :], mask=h_mask[:, None], other=0.0)
+    q_n3 = tl.load(q_ptrs + (w_offs * 4 + 3)[None, :], mask=h_mask[:, None], other=0.0)
+    q_rope = tl.load(
+        q_ptrs + NOPE_DIM_RT + rope_offs[None, :], mask=h_mask[:, None], other=0.0
+    )
+
+    valid_topk = topk
+    if has_topk_len:
+        valid_topk = tl.load(topk_len_ptr + bid).to(tl.int32)
+        valid_topk = tl.minimum(valid_topk, topk)
+
+    m_i = tl.full([BLOCK_H], -1e30, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc_n0 = tl.zeros([BLOCK_H, NOPE_PAD // 4], dtype=tl.float32)
+    acc_n1 = tl.zeros([BLOCK_H, NOPE_PAD // 4], dtype=tl.float32)
+    acc_n2 = tl.zeros([BLOCK_H, NOPE_PAD // 4], dtype=tl.float32)
+    acc_n3 = tl.zeros([BLOCK_H, NOPE_PAD // 4], dtype=tl.float32)
+    acc_rope = tl.zeros([BLOCK_H, ROPE_DIM], dtype=tl.float32)
+
+    t_offs = tl.arange(0, BLOCK_T)
+
+    n_tiles = tl.cdiv(topk, BLOCK_T)
+    tiles_per_split = tl.cdiv(n_tiles, NUM_SPLITS)
+    t_begin = split_id * tiles_per_split * BLOCK_T
+    t_stop = tl.minimum(topk, t_begin + tiles_per_split * BLOCK_T)
+
+    for tile_start in tl.range(t_begin, t_stop, BLOCK_T, num_stages=LOOP_STAGES):
+        t_idx = tile_start + t_offs
+        t_in_bounds = t_idx < topk
+        t_valid = t_idx < valid_topk
+
+        raw_indices = tl.load(
+            indices_ptr + bid * stride_ib + t_idx, mask=t_in_bounds, other=-1
+        )
+        idx_valid = t_valid & (raw_indices >= 0)
+
+        safe_indices = tl.where(idx_valid, raw_indices, tl.zeros_like(raw_indices))
+        page_ids = (safe_indices // page_size).to(tl.int64)
+        page_offs_t = (safe_indices % page_size).to(tl.int64)
+        token_data_bases = page_ids * page_bytes + page_offs_t * 576
+
+        # ---- KV nope: dequantise ----
+        # Add the int64 base to the pointer first to get a [BLOCK_T] pointer
+        # vector, then broadcast the int32 inner offsets. Doing it the other way
+        # materialises an int64 [BLOCK_T, 512] address tensor (64 x 512 x 8B =
+        # 256 KB of registers), and int64 arithmetic is slow on top of that.
+        # Reading 4 bytes at a time cuts the load count to a quarter; both the
+        # per-token base and the 576-byte stride are multiples of 4, so the
+        # alignment holds.
+        w_ptrs = cache_i32_ptr + (token_data_bases // 4)
+        kv_w = tl.load(
+            w_ptrs[:, None] + w_offs[None, :], mask=idx_valid[:, None], other=0
+        )  # [BLOCK_T, 128] int32
+        # Zero the tail past NOPE_DIM_RT on the packed word instead of on the four
+        # decoded slices: one select replaces four. A zero byte decodes through the
+        # subnormal branch to exactly 0.0, so this is not an approximation -- and it
+        # must stay a mask rather than be dropped, because the bytes past the nope
+        # section are rope bf16 reinterpreted as E4M3 and can decode to inf, which
+        # would turn a 0 * inf product into NaN. The row mask above matters for the
+        # same reason: invalid lanes are clamped to slot 0, and if that slot was
+        # never written the garbage bytes can decode to inf/NaN, which p=0 cannot
+        # cancel in the PV dot (0 * inf = NaN).
+        kv_w = tl.where((w_offs < (NOPE_DIM_RT // 4))[None, :], kv_w, 0)
+        b0 = kv_w & 0xFF
+        b1 = (kv_w >> 8) & 0xFF
+        b2 = (kv_w >> 16) & 0xFF
+        b3 = (kv_w >> 24) & 0xFF
+
+        # Scales: element 4m+j belongs to group (4m+j)//64 = m//16, since j < 4
+        # never crosses a 64-element boundary -- so all 4 slices share one index.
+        scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
+        scale_base_ptrs = cache_uint8_ptr + scale_bases
+        # There are only 8 distinct scale bytes per token, but indexing by
+        # (w_offs // 16) issued 128 loads to fetch them. Loading 8 and
+        # broadcasting cuts that to a sixteenth.
+        # The broadcast expands [BLOCK_T, 8] -> [BLOCK_T, 8, 16] -> [BLOCK_T, 128].
+        s8 = tl.load(
+            scale_base_ptrs[:, None] + tl.arange(0, 8)[None, :],
+            mask=idx_valid[:, None],
+            other=127,
+        )  # [BLOCK_T, 8]
+        scale_raw = tl.reshape(
+            tl.broadcast_to(s8[:, :, None], (BLOCK_T, 8, NOPE_PAD // 4 // 8)),
+            (BLOCK_T, NOPE_PAD // 4),
+        )
+        # Tried replacing exp2 with bit assembly here (2^(s-127) is just s in the
+        # exponent field): measurably slower, 10.58 -> 12.05 ms. exp2 is a single
+        # ex2.approx instruction in hardware, so assembling bits adds work.
+        # The scale goes straight into the exponent field, no exp2.
+        sc_i = scale_raw.to(tl.int32)  # [BLOCK_T, 128]
+
+        # Zero the tail past 448: element 4m+j < 448 iff m < 112 (448/4).
+        # Folding this into the scale to save 4 wheres was also slower; reverted.
+        kv0 = _e4m3_scaled(b0, sc_i).to(tl.bfloat16)
+        kv1 = _e4m3_scaled(b1, sc_i).to(tl.bfloat16)
+        kv2 = _e4m3_scaled(b2, sc_i).to(tl.bfloat16)
+        kv3 = _e4m3_scaled(b3, sc_i).to(tl.bfloat16)
+
+        rope_base_ptrs = cache_bf16_ptr + ((token_data_bases + 448) // 2)
+        kv_rope = tl.load(
+            rope_base_ptrs[:, None] + rope_offs[None, :],
+            mask=idx_valid[:, None],
+            other=0.0,
+        )
+
+        # ---- QK: [BLOCK_H, BLOCK_T], 4 nope slices plus 1 rope slice ----
+        scores = tl.dot(q_n0, tl.trans(kv0))
+        scores += tl.dot(q_n1, tl.trans(kv1))
+        scores += tl.dot(q_n2, tl.trans(kv2))
+        scores += tl.dot(q_n3, tl.trans(kv3))
+        scores += tl.dot(q_rope, tl.trans(kv_rope))
+        scores = scores * sm_scale
+        scores = tl.where(idx_valid[None, :], scores, -1e30)
+
+        scores_log2 = scores * LOG2E
+        tile_max = tl.max(scores_log2, axis=1)  # [BLOCK_H]
+        m_new = tl.maximum(m_i, tile_max)
+        alpha = tl.math.exp2(m_i - m_new)  # [BLOCK_H]
+        p = tl.math.exp2(scores_log2 - m_new[:, None])  # [BLOCK_H, BLOCK_T]
+        p = tl.where(idx_valid[None, :], p, 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        p_b = p.to(tl.bfloat16)
+        acc_n0 = acc_n0 * alpha[:, None] + tl.dot(p_b, kv0)
+        acc_n1 = acc_n1 * alpha[:, None] + tl.dot(p_b, kv1)
+        acc_n2 = acc_n2 * alpha[:, None] + tl.dot(p_b, kv2)
+        acc_n3 = acc_n3 * alpha[:, None] + tl.dot(p_b, kv3)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_b, kv_rope)
+        m_i = m_new
+
+    safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    acc_rope = acc_rope / safe_l[:, None]
+    lse = tl.where(l_i > 0.0, m_i / LOG2E + tl.math.log(safe_l), float("-inf"))
+
+    o_ptrs = (
+        O_ptr
+        + (bid * NUM_SPLITS + split_id) * stride_ob
+        + h_offs[:, None] * stride_oh
+    )
+    w_keep_o = (w_offs < (NOPE_DIM_RT // 4))[None, :]
+    om = h_mask[:, None] & w_keep_o
+    tl.store(
+        o_ptrs + (w_offs * 4 + 0)[None, :],
+        (acc_n0 / safe_l[:, None]).to(tl.bfloat16),
+        mask=om,
+    )
+    tl.store(
+        o_ptrs + (w_offs * 4 + 1)[None, :],
+        (acc_n1 / safe_l[:, None]).to(tl.bfloat16),
+        mask=om,
+    )
+    tl.store(
+        o_ptrs + (w_offs * 4 + 2)[None, :],
+        (acc_n2 / safe_l[:, None]).to(tl.bfloat16),
+        mask=om,
+    )
+    tl.store(
+        o_ptrs + (w_offs * 4 + 3)[None, :],
+        (acc_n3 / safe_l[:, None]).to(tl.bfloat16),
+        mask=om,
+    )
+    tl.store(
+        o_ptrs + NOPE_DIM_RT + rope_offs[None, :],
+        acc_rope.to(tl.bfloat16),
+        mask=h_mask[:, None],
+    )
+    tl.store(LSE_ptr + (bid * NUM_SPLITS + split_id) * H + h_offs, lse, mask=h_mask)
+
+
+
+
+@triton.jit
+def _merge_splits_kernel(
+    O_part_ptr, LSE_part_ptr, O_ptr, LSE_ptr,
+    H: tl.int32, D: tl.constexpr, NUM_SPLITS: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """LSE-weighted merge of NUM_SPLITS partial attention results.
+
+    Grid is (B, H). Each split already normalised its own output, so combining
+    them is the softmax-denominator average exp(lse_i - m) -- the identity
+    _merge_partial_attn uses for two inputs, generalised to N.
+    """
+    bid = tl.program_id(0)
+    h = tl.program_id(1)
+
+    m = -float("inf")
+    for i in tl.static_range(NUM_SPLITS):
+        m = tl.maximum(m, tl.load(LSE_part_ptr + (bid * NUM_SPLITS + i) * H + h))
+
+    sw = 0.0
+    for i in tl.static_range(NUM_SPLITS):
+        li = tl.load(LSE_part_ptr + (bid * NUM_SPLITS + i) * H + h)
+        sw += tl.where(li > -1e20, tl.exp(li - m), 0.0)
+    safe_sw = tl.where(sw > 0, sw, 1.0)
+
+    d_offs = tl.arange(0, BLOCK_D)
+    for d0 in tl.range(0, D, BLOCK_D):
+        dm = d0 + d_offs < D
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for i in tl.static_range(NUM_SPLITS):
+            li = tl.load(LSE_part_ptr + (bid * NUM_SPLITS + i) * H + h)
+            wi = tl.where(li > -1e20, tl.exp(li - m), 0.0)
+            v = tl.load(
+                O_part_ptr + ((bid * NUM_SPLITS + i) * H + h) * D + d0 + d_offs,
+                mask=dm, other=0.0,
+            ).to(tl.float32)
+            acc += v * wi
+        tl.store(O_ptr + (bid * H + h) * D + d0 + d_offs,
+                 (acc / safe_sw).to(tl.bfloat16), mask=dm)
+
+    tl.store(LSE_ptr + bid * H + h, m + tl.log(safe_sw))
+
+
+_SM_COUNT = 108
+# Splitting more ways than this stops paying: the merge reads one partial per
+# split per (batch, head), and past ~32 that read dominates.
+_MAX_KV_SPLITS = 32
+# Beyond this many programs the grid already covers enough of the machine that
+# the merge costs more than the added parallelism returns.
+_SPLIT_BASE_CEILING = 32
+
+
+def _choose_num_kv_splits(batch: int, h_blocks: int, topk: int, block_t: int = 16) -> int:
+    """How many ways to split the topk axis, or 1 to keep the single-pass kernel.
+
+    ``topk`` here is the padded width, not the live extent: the real one is
+    ``topk_length`` on device, and reading it would sync inside a CUDA graph.
+    So this deliberately under-splits -- a split landing past the real content
+    retires immediately, but one that never happened cannot be undone.
+
+    Measured on A100 at the serving shape (padded 8256, valid varying):
+
+        B=6,  valid 8256 -> 5.65x   B=12, valid 8256 -> 3.37x
+        B=6,  valid 2048 -> 2.76x   B=1,  valid 2048 -> 4.31x
+        B=48, valid 2048 -> 0.62x with splits on, hence the base ceiling
+        B=1,  valid 512  -> 0.84x at 108 splits, 1.11x once capped at 32
+    """
+    base = batch * h_blocks
+    if base >= _SPLIT_BASE_CEILING:
+        return 1
+    n_tiles = triton.cdiv(topk, block_t)
+    if n_tiles < 8 * base:
+        return 1
+    return max(1, min(triton.cdiv(_SM_COUNT, base), n_tiles, _MAX_KV_SPLITS))
+
+
 def _run_triton_sparse_decode(
     q: torch.Tensor,  # [B, 1, H, D] bf16
     k_cache: torch.Tensor,  # [num_pages, page_size, 1, bpt] float8
@@ -399,6 +707,44 @@ def _run_triton_sparse_decode(
     # Multi-head kernel: a batch of heads per program, KV read once per tile.
     # The first argument becomes an int32 view of the same buffer.
     raw_i32 = raw_uint8.view(torch.int32)
+
+    _SPLIT_BLOCK_H = 64
+    _SPLIT_BLOCK_T = 16
+    num_kv_splits = _choose_num_kv_splits(
+        B, triton.cdiv(H, _SPLIT_BLOCK_H), topk, _SPLIT_BLOCK_T
+    )
+    if num_kv_splits > 1:
+        out_part = torch.zeros(
+            B * num_kv_splits, H, D, dtype=torch.bfloat16, device=q.device
+        )
+        lse_part = torch.full(
+            (B * num_kv_splits, H), float("-inf"),
+            dtype=torch.float32, device=q.device,
+        )
+        _tiled_sparse_decode_kernel_split[
+            (B, triton.cdiv(H, _SPLIT_BLOCK_H), num_kv_splits)
+        ](
+            q3, raw_i32, raw_uint8, raw_bf16, flat_indices,
+            (
+                topk_length
+                if topk_length is not None
+                else torch.empty(0, device=q.device, dtype=torch.int32)
+            ),
+            out_part, lse_part, softmax_scale, page_size,
+            int(page_bytes), int(page_size * _TOKEN_DATA_STRIDE),
+            H, topk, topk_rounded, topk_length is not None,
+            q3.stride(0), q3.stride(1),
+            out_part.stride(0), out_part.stride(1), flat_indices.stride(0),
+            NOPE_PAD=512, ROPE_DIM=_ROPE_DIM, NOPE_DIM_RT=_NOPE_DIM,
+            BLOCK_T=_SPLIT_BLOCK_T, BLOCK_H=_SPLIT_BLOCK_H, LOOP_STAGES=3,
+            NUM_SPLITS=num_kv_splits, num_warps=4, num_stages=2,
+        )
+        _merge_splits_kernel[(B, H)](
+            out_part, lse_part, out, lse, H,
+            D=D, NUM_SPLITS=num_kv_splits, BLOCK_D=128,
+        )
+        return out.unsqueeze(1), lse.unsqueeze(1)
+
     grid = lambda META: (B, triton.cdiv(H, META["BLOCK_H"]))
     _tiled_sparse_decode_kernel_mh[grid](
         q3,
