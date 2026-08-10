@@ -435,6 +435,49 @@ def _run_triton_sparse_decode(
     return out.unsqueeze(1), lse.unsqueeze(1)
 
 
+@triton.jit
+def _scale_rows_kernel(out_ptr, w_ptr, D: tl.constexpr, BLOCK: tl.constexpr):
+    """out[row, :] *= w[row], reading bf16 and multiplying in fp32.
+
+    The torch form (`out.float() * w.unsqueeze(-1)`) materialises the whole
+    output twice in fp32 -- at 8K tokens x 64 heads x 512 that is 2 GB of
+    transient, which is what OOMed the first batched run. Here the fp32 value
+    never leaves a register, so the rounding matches the torch form exactly
+    while the transient disappears.
+    """
+    row = tl.program_id(0)
+    w = tl.load(w_ptr + row)
+    offs = tl.arange(0, BLOCK)
+    for d0 in tl.range(0, D, BLOCK):
+        m = d0 + offs < D
+        p = out_ptr + row * D + d0 + offs
+        v = tl.load(p, mask=m).to(tl.float32)
+        tl.store(p, (v * w).to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _merge_rows_kernel(
+    o1_ptr, o2_ptr, w1_ptr, w2_ptr, tot_ptr, D: tl.constexpr, BLOCK: tl.constexpr
+):
+    """o1[row, :] = (w1*o1 + w2*o2) / total, accumulating in fp32.
+
+    Same reasoning as _scale_rows_kernel; the torch form needed four
+    output-sized fp32 temporaries for this one expression.
+    """
+    row = tl.program_id(0)
+    w1 = tl.load(w1_ptr + row)
+    w2 = tl.load(w2_ptr + row)
+    t = tl.load(tot_ptr + row)
+    offs = tl.arange(0, BLOCK)
+    for d0 in tl.range(0, D, BLOCK):
+        m = d0 + offs < D
+        p1 = o1_ptr + row * D + d0 + offs
+        p2 = o2_ptr + row * D + d0 + offs
+        v1 = tl.load(p1, mask=m).to(tl.float32)
+        v2 = tl.load(p2, mask=m).to(tl.float32)
+        tl.store(p1, ((v1 * w1 + v2 * w2) / t).to(tl.bfloat16), mask=m)
+
+
 def _merge_partial_attn(
     out1: torch.Tensor,
     lse1: torch.Tensor,
@@ -443,17 +486,18 @@ def _merge_partial_attn(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Merge two attention outputs using LSE-weighted combination.
 
-    out: [B, 1, H, D] bf16,  lse: [B, 1, H] float32
+    out: [B, 1, H, D] bf16,  lse: [B, 1, H] float32. Merges into out1.
     """
     max_lse = torch.maximum(lse1, lse2)
     w1 = torch.where(lse1 > -1e20, torch.exp(lse1 - max_lse), torch.zeros_like(lse1))
     w2 = torch.where(lse2 > -1e20, torch.exp(lse2 - max_lse), torch.zeros_like(lse2))
     total = (w1 + w2).clamp(min=1e-20)
-    merged = (
-        w1.unsqueeze(-1) * out1.float() + w2.unsqueeze(-1) * out2.float()
-    ) / total.unsqueeze(-1)
-    merged_lse = max_lse + torch.log(total)
-    return merged.to(torch.bfloat16), merged_lse
+    D = out1.shape[-1]
+    _merge_rows_kernel[(out1.numel() // D,)](
+        out1, out2.contiguous(), w1.contiguous(), w2.contiguous(),
+        total.contiguous(), D=D, BLOCK=256,
+    )
+    return out1, max_lse + torch.log(total)
 
 
 def _apply_attn_sink(
@@ -464,18 +508,18 @@ def _apply_attn_sink(
     """Apply attention sink normalization.
 
     The sink adds to the softmax denominator without contributing output,
-    effectively down-weighting all attention scores.
+    effectively down-weighting all attention scores. Scales ``out`` in place.
 
     out: [B, 1, H, D] bf16,  lse: [B, 1, H] f32,  attn_sink: [H] f32
     """
     sink_lse = attn_sink.view(1, 1, -1).expand_as(lse)
     combined_lse = torch.logaddexp(lse, sink_lse)
     w = torch.where(
-        lse > -1e20,
-        torch.exp(lse - combined_lse),
-        torch.zeros_like(lse),
+        lse > -1e20, torch.exp(lse - combined_lse), torch.zeros_like(lse)
     )
-    return (out.float() * w.unsqueeze(-1)).to(torch.bfloat16), combined_lse
+    D = out.shape[-1]
+    _scale_rows_kernel[(out.numel() // D,)](out, w.contiguous(), D=D, BLOCK=256)
+    return out, combined_lse
 
 
 def flash_mla_sparse_decode_triton(
