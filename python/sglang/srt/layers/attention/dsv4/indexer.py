@@ -63,6 +63,42 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _arange_cache = {}
 
+# deep_gemm's indexer kernels assert `arch_major in {9, 10}` inside the kernel
+# (csrc/apis/attention.hpp), so on any other architecture the assertion kills
+# the scheduler rather than raising something a fallback could catch. Enumerate
+# the architectures that *do* have the kernel, so anything new degrades to the
+# Triton path instead of dying.
+_DEEP_GEMM_INDEXER_CAPABILITIES = (9, 10)
+_has_deep_gemm_indexer = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] in _DEEP_GEMM_INDEXER_CAPABILITIES
+)
+
+
+def fp8_paged_mqa_logits_triton_adapter(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """Give the Triton paged kernel the call signature this dispatch site uses.
+
+    The Triton kernel needs no scheduling metadata: DeepGEMM's tile scheduler is
+    what `deep_gemm_metadata` describes, and Triton derives its own grid.
+    """
+    _ = deep_gemm_metadata
+    from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+        fp8_paged_mqa_logits_triton,
+    )
+
+    return fp8_paged_mqa_logits_triton(
+        q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len, clean_logits
+    )
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -613,8 +649,6 @@ class C4IndexerBackendMixin:
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         plan: NonPagedIndexerPlan,
     ) -> torch.Tensor:
-        import deep_gemm
-
         k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
             layer_id=c4_indexer.layer_id,
             seq_len_tensor=plan.gather_seq_lens,
@@ -624,6 +658,24 @@ class C4IndexerBackendMixin:
         )
         k_fp8 = k_u8.view(FP8_DTYPE)
         k_scale = scale_u8.view(torch.float32).squeeze(-1)
+        if not _has_deep_gemm_indexer:
+            from sglang.kernels.ops.attention.dsa.mqa_logits_triton import (
+                fp8_mqa_logits_triton,
+            )
+
+            # The Triton kernel sizes its output from the gathered K itself, so
+            # it needs no max_seqlen_k; the gather is already page-aligned to it.
+            return fp8_mqa_logits_triton(
+                q_indexer[: plan.query_rows],
+                (k_fp8, k_scale),
+                weights[: plan.query_rows],
+                plan.ks,
+                plan.ke,
+                clean_logits=False,
+            )
+
+        import deep_gemm
+
         return deep_gemm.fp8_mqa_logits(
             q_indexer[: plan.query_rows],
             (k_fp8, k_scale),
@@ -724,6 +776,8 @@ class C4IndexerBackendMixin:
             # TODO: switch from triton to SYCL when OOM is resolved
 
             fn = fp8_paged_mqa_logits_triton
+        elif not _has_deep_gemm_indexer:
+            fn = fp8_paged_mqa_logits_triton_adapter
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
@@ -747,7 +801,14 @@ class C4IndexerBackendMixin:
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
-        if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
+        # The trailing dim is what DeepGEMM's paged kernel wants; the tilelang,
+        # aiter and Triton kernels all take the plain [B] lengths.
+        if (
+            _c4sl.dim() == 1
+            and not _use_tilelang
+            and not _use_aiter
+            and _has_deep_gemm_indexer
+        ):
             _c4sl = _c4sl.unsqueeze(-1)
         nonpaged_plan = self._get_nonpaged_indexer_plan(
             c4_indexer=c4_indexer,
