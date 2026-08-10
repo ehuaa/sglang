@@ -81,6 +81,19 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+# The FlashMLA sparse CUDA kernels are arch-conditional builds; the target list
+# lives in kernels/aot/cmake/flashmla.cmake: sm_90a, sm_100f, and (with CUDA
+# 13+) sm_103a. 'a'/'f' binaries do not carry forward across compute
+# capabilities, so this is an exact-match list. Naming the architectures that
+# *do* have the kernel (rather than the ones that don't) is what makes the
+# polarity right: an architecture nobody has enumerated yet falls back instead
+# of dispatching into a kernel that was never built for it.
+_flashmla_kernel_capabilities = ((9, 0), (10, 0), (10, 3))
+_use_mla_fallback = (
+    torch.cuda.get_device_capability() not in _flashmla_kernel_capabilities
+    if torch.cuda.is_available()
+    else False
+)
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -136,7 +149,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if _use_mla_fallback or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1698,10 +1711,10 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # sparse_prefill_fwd needs the FlashMLA CUDA kernels.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not _use_mla_fallback
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1717,7 +1730,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _use_mla_fallback:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
