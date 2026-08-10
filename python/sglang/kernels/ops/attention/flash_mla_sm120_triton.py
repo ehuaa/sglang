@@ -219,7 +219,14 @@ def _tiled_sparse_decode_kernel_mh(
 
     t_offs = tl.arange(0, BLOCK_T)
 
-    for tile_start in tl.range(0, topk, BLOCK_T, num_stages=LOOP_STAGES):
+    # Bound the loop by valid_topk (the real entry count) instead of the padded
+    # topk width. The t_valid mask already truncated at valid_topk, so
+    # per-element semantics are unchanged -- this only stops fully-masked tail
+    # tiles from being issued. The padded width is the CUDA-graph capacity
+    # (measured here: topk=8256 while real content is far shorter), which is
+    # what made this kernel ~74% of decode GPU time.
+    loop_end = ((valid_topk + BLOCK_T - 1) // BLOCK_T) * BLOCK_T
+    for tile_start in tl.range(0, loop_end, BLOCK_T, num_stages=LOOP_STAGES):
         t_idx = tile_start + t_offs
         t_in_bounds = t_idx < topk
         t_valid = t_idx < valid_topk
@@ -393,9 +400,9 @@ def _tiled_sparse_decode_kernel_split(
     """Grid is (B, ceil(H / BLOCK_H), NUM_SPLITS).
 
     Same body as the single-pass kernel, but each program covers only its slice
-    of the topk axis and writes an un-merged (output, lse) pair. Decode grids
-    are tiny -- B is the batch and H/BLOCK_H is usually 1 -- so without
-    splitting the launch occupies a handful of the GPU's 108 SMs.
+    of the topk axis and writes an un-merged (output, lse) pair. Decode grids are
+    tiny -- B is the batch and H/BLOCK_H is usually 1 -- so without splitting the
+    launch occupies a handful of the GPU's 108 SMs.
     """
     bid = tl.program_id(0)
     hblk = tl.program_id(1)
@@ -441,10 +448,15 @@ def _tiled_sparse_decode_kernel_split(
 
     t_offs = tl.arange(0, BLOCK_T)
 
-    n_tiles = tl.cdiv(topk, BLOCK_T)
+    # Same valid_topk bound as the single-pass kernel, then carve this
+    # program's slice out of the *real* extent. Splits past the real content
+    # get an empty range and retire immediately; the host picks NUM_SPLITS from
+    # the padded width because the real one is only known on device.
+    loop_end = ((valid_topk + BLOCK_T - 1) // BLOCK_T) * BLOCK_T
+    n_tiles = tl.cdiv(loop_end, BLOCK_T)
     tiles_per_split = tl.cdiv(n_tiles, NUM_SPLITS)
     t_begin = split_id * tiles_per_split * BLOCK_T
-    t_stop = tl.minimum(topk, t_begin + tiles_per_split * BLOCK_T)
+    t_stop = tl.minimum(loop_end, t_begin + tiles_per_split * BLOCK_T)
 
     for tile_start in tl.range(t_begin, t_stop, BLOCK_T, num_stages=LOOP_STAGES):
         t_idx = tile_start + t_offs
@@ -594,13 +606,19 @@ def _tiled_sparse_decode_kernel_split(
 
 @triton.jit
 def _merge_splits_kernel(
-    O_part_ptr, LSE_part_ptr, O_ptr, LSE_ptr,
-    H: tl.int32, D: tl.constexpr, NUM_SPLITS: tl.constexpr, BLOCK_D: tl.constexpr,
+    O_part_ptr,
+    LSE_part_ptr,
+    O_ptr,
+    LSE_ptr,
+    H: tl.int32,
+    D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     """LSE-weighted merge of NUM_SPLITS partial attention results.
 
     Grid is (B, H). Each split already normalised its own output, so combining
-    them is the softmax-denominator average exp(lse_i - m) -- the identity
+    them is the softmax-denominator average exp(lse_i - m) -- the same identity
     _merge_partial_attn uses for two inputs, generalised to N.
     """
     bid = tl.program_id(0)
@@ -625,21 +643,29 @@ def _merge_splits_kernel(
             wi = tl.where(li > -1e20, tl.exp(li - m), 0.0)
             v = tl.load(
                 O_part_ptr + ((bid * NUM_SPLITS + i) * H + h) * D + d0 + d_offs,
-                mask=dm, other=0.0,
+                mask=dm,
+                other=0.0,
             ).to(tl.float32)
             acc += v * wi
-        tl.store(O_ptr + (bid * H + h) * D + d0 + d_offs,
-                 (acc / safe_sw).to(tl.bfloat16), mask=dm)
+        tl.store(O_ptr + (bid * H + h) * D + d0 + d_offs, (acc / safe_sw).to(tl.bfloat16), mask=dm)
 
     tl.store(LSE_ptr + bid * H + h, m + tl.log(safe_sw))
 
 
+# A100 has 108 SMs. The single-pass grid is (B, ceil(H/BLOCK_H)) and BLOCK_H is
+# 64 = H, so it collapses to (B, 1): a decode batch of 6 occupies 6 SMs. Split
+# the topk axis until the grid covers the machine, but never past one tile per
+# split (BLOCK_T=16 rows) or the splits stop carrying work.
 _SM_COUNT = 108
+
+
 # Splitting more ways than this stops paying: the merge reads one partial per
-# split per (batch, head), and past ~32 that read dominates.
+# split per (batch, head), and past ~32 that read dominates a kernel whose loop
+# is already bounded by valid_topk.
 _MAX_KV_SPLITS = 32
 # Beyond this many programs the grid already covers enough of the machine that
-# the merge costs more than the added parallelism returns.
+# the merge costs more than the added parallelism returns (measured: B=48 runs
+# 0.62-0.69x with splits on).
 _SPLIT_BASE_CEILING = 32
 
 
@@ -648,15 +674,15 @@ def _choose_num_kv_splits(batch: int, h_blocks: int, topk: int, block_t: int = 1
 
     ``topk`` here is the padded width, not the live extent: the real one is
     ``topk_length`` on device, and reading it would sync inside a CUDA graph.
-    So this deliberately under-splits -- a split landing past the real content
-    retires immediately, but one that never happened cannot be undone.
+    So this deliberately under-splits -- a split that lands past the real
+    content retires immediately, but one that never happened cannot be undone.
 
-    Measured on A100 at the serving shape (padded 8256, valid varying):
+    Measured on A100 with the serving shape (padded 8256, valid varying):
 
-        B=6,  valid 8256 -> 5.65x   B=12, valid 8256 -> 3.37x
-        B=6,  valid 2048 -> 2.76x   B=1,  valid 2048 -> 4.31x
-        B=48, valid 2048 -> 0.62x with splits on, hence the base ceiling
-        B=1,  valid 512  -> 0.84x at 108 splits, 1.11x once capped at 32
+        B=6,  valid 8256 -> 5.53x   B=12, valid 8256 -> 3.37x
+        B=6,  valid 2048 -> 2.75x   B=12, valid 2048 -> 2.12x
+        B=1,  valid 512  -> 0.84x   (108 splits over 32 tiles: mostly empty)
+        B=48, valid 2048 -> 0.62x   (grid already wide enough)
     """
     base = batch * h_blocks
     if base >= _SPLIT_BASE_CEILING:
@@ -718,30 +744,58 @@ def _run_triton_sparse_decode(
             B * num_kv_splits, H, D, dtype=torch.bfloat16, device=q.device
         )
         lse_part = torch.full(
-            (B * num_kv_splits, H), float("-inf"),
-            dtype=torch.float32, device=q.device,
+            (B * num_kv_splits, H),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
         )
         _tiled_sparse_decode_kernel_split[
             (B, triton.cdiv(H, _SPLIT_BLOCK_H), num_kv_splits)
         ](
-            q3, raw_i32, raw_uint8, raw_bf16, flat_indices,
+            q3,
+            raw_i32,
+            raw_uint8,
+            raw_bf16,
+            flat_indices,
             (
                 topk_length
                 if topk_length is not None
                 else torch.empty(0, device=q.device, dtype=torch.int32)
             ),
-            out_part, lse_part, softmax_scale, page_size,
-            int(page_bytes), int(page_size * _TOKEN_DATA_STRIDE),
-            H, topk, topk_rounded, topk_length is not None,
-            q3.stride(0), q3.stride(1),
-            out_part.stride(0), out_part.stride(1), flat_indices.stride(0),
-            NOPE_PAD=512, ROPE_DIM=_ROPE_DIM, NOPE_DIM_RT=_NOPE_DIM,
-            BLOCK_T=_SPLIT_BLOCK_T, BLOCK_H=_SPLIT_BLOCK_H, LOOP_STAGES=3,
-            NUM_SPLITS=num_kv_splits, num_warps=4, num_stages=2,
+            out_part,
+            lse_part,
+            softmax_scale,
+            page_size,
+            int(page_bytes),
+            int(page_size * _TOKEN_DATA_STRIDE),
+            H,
+            topk,
+            topk_rounded,
+            topk_length is not None,
+            q3.stride(0),
+            q3.stride(1),
+            out_part.stride(0),
+            out_part.stride(1),
+            flat_indices.stride(0),
+            NOPE_PAD=512,
+            ROPE_DIM=_ROPE_DIM,
+            NOPE_DIM_RT=_NOPE_DIM,
+            BLOCK_T=_SPLIT_BLOCK_T,
+            BLOCK_H=_SPLIT_BLOCK_H,
+            LOOP_STAGES=3,
+            NUM_SPLITS=num_kv_splits,
+            num_warps=4,
+            num_stages=2,
         )
         _merge_splits_kernel[(B, H)](
-            out_part, lse_part, out, lse, H,
-            D=D, NUM_SPLITS=num_kv_splits, BLOCK_D=128,
+            out_part,
+            lse_part,
+            out,
+            lse,
+            H,
+            D=D,
+            NUM_SPLITS=num_kv_splits,
+            BLOCK_D=128,
         )
         return out.unsqueeze(1), lse.unsqueeze(1)
 
@@ -840,8 +894,13 @@ def _merge_partial_attn(
     total = (w1 + w2).clamp(min=1e-20)
     D = out1.shape[-1]
     _merge_rows_kernel[(out1.numel() // D,)](
-        out1, out2.contiguous(), w1.contiguous(), w2.contiguous(),
-        total.contiguous(), D=D, BLOCK=256,
+        out1,
+        out2.contiguous(),
+        w1.contiguous(),
+        w2.contiguous(),
+        total.contiguous(),
+        D=D,
+        BLOCK=256,
     )
     return out1, max_lse + torch.log(total)
 
@@ -861,7 +920,9 @@ def _apply_attn_sink(
     sink_lse = attn_sink.view(1, 1, -1).expand_as(lse)
     combined_lse = torch.logaddexp(lse, sink_lse)
     w = torch.where(
-        lse > -1e20, torch.exp(lse - combined_lse), torch.zeros_like(lse)
+        lse > -1e20,
+        torch.exp(lse - combined_lse),
+        torch.zeros_like(lse),
     )
     D = out.shape[-1]
     _scale_rows_kernel[(out.numel() // D,)](out, w.contiguous(), D=D, BLOCK=256)
