@@ -188,8 +188,10 @@ def _fp8_paged_mqa_logits_kernel(
         valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
         out = tl.where(valid, out, float("-inf"))
 
+        # See `_fp8_mqa_logits_kernel` for why the row base is widened to int64
+        # here and nowhere else.
         tl.store(
-            logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+            logits_ptr + token_id.to(tl.int64) * stride_l_t + k_offset * stride_l_n,
             out,
             mask=mask_n,
         )
@@ -346,8 +348,19 @@ def _fp8_mqa_logits_kernel(
     if (n_start >= tl.max(ke_blk)) | (n_start + BLOCK_N <= tl.min(ks_blk)):
         # When `clean_logits=False` the caller skipped the -inf pre-fill, so
         # write -inf here for the early-exit tile.
+        # `logits` is [M, N] fp32, so the row base is `m * N` in ELEMENTS and
+        # Triton does not promote int multiplies. M is the chunked-prefill size
+        # and N is the c4 indexer width (context / 4), so M * N reaches 2**31 at
+        # chunked_prefill_size 8192 and a 1M context -- exactly int32 max, zero
+        # headroom. A larger chunk (max_prefill_tokens already allows 16384)
+        # wraps the offset negative into an illegal access. Widen the two store
+        # addresses only: the q / weights / ks / ke loads are indexed by the
+        # same rows but with strides small enough that they cannot overflow, and
+        # widening `m_block` itself instead costs ~8% on this kernel.
         tl.store(
-            logits_ptr + offs_m[:, None] * stride_l_m + offs_n[None, :] * stride_l_n,
+            logits_ptr
+            + offs_m[:, None].to(tl.int64) * stride_l_m
+            + offs_n[None, :] * stride_l_n,
             tl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=tl.float32),
             mask=mask_m[:, None] & mask_n[None, :],
         )
@@ -398,7 +411,7 @@ def _fp8_mqa_logits_kernel(
         out = tl.where(valid, out, float("-inf"))
 
         tl.store(
-            logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+            logits_ptr + m.to(tl.int64) * stride_l_m + offs_n * stride_l_n,
             out,
             mask=mask_n & alive,
         )
