@@ -61,6 +61,30 @@ _PREFILL_AUTOTUNE_CONFIGS = [
 # iterations.
 _PREFILL_BLOCK_M = 16
 
+# ...but that sweep ran at num_heads=32, and the intensity term
+# 1/(BLOCK_M*num_heads) means the optimum moves with the head count. Re-swept on
+# A100 at num_heads=64 (DeepSeek-V4-Flash) over M in {256..8192} x N in
+# {8192..262144}: BLOCK_M=8 wins by 1.27-1.44x at every M >= 1536, ties at
+# M=1024, and loses slightly below that. num_heads=32 re-confirmed BLOCK_M=16
+# across the same grid, so this has to key on both.
+#
+# The mechanism is L2 residency of q, not occupancy: at M=8192 / num_heads=64 the
+# q tile is 134 MB against a 40 MB L2, so the kernel pays for re-reads and the
+# narrower M tile cuts them; at M <= 1024 q fits and BLOCK_M stops mattering.
+# Occupancy is a red herring -- num_warps=8 lifts it 12% -> 25% and is 9% SLOWER,
+# because this kernel is short of registers, not of warps.
+_PREFILL_BLOCK_M_WIDE_HEADS = 8
+_PREFILL_WIDE_HEADS = 64
+_PREFILL_WIDE_HEADS_MIN_M = 1024
+
+
+def _prefill_block_m(num_heads: int, m: int) -> int:
+    if num_heads >= _PREFILL_WIDE_HEADS and m >= _PREFILL_WIDE_HEADS_MIN_M:
+        block_m = _PREFILL_BLOCK_M_WIDE_HEADS
+    else:
+        block_m = _PREFILL_BLOCK_M
+    return min(block_m, triton.next_power_of_2(m))
+
 # Warmup shape mirrors the chunked-prefill regime so autotune picks a tile
 # sized for real serving. M matters now that the kernel tiles over it -- a
 # dummy M of 8 would leave a single program on the M axis and mis-rank BLOCK_N.
@@ -453,7 +477,7 @@ def fp8_mqa_logits_triton(
     BLOCK_D = triton.next_power_of_2(head_dim)
     # The M loop is a `static_range`, so an oversized BLOCK_M costs masked-off
     # iterations on short prefills (draft extend, tiny chunks). Cap it by M.
-    BLOCK_M = min(_PREFILL_BLOCK_M, triton.next_power_of_2(M))
+    BLOCK_M = _prefill_block_m(num_heads, M)
 
     # Pre-decode FP8 -> bf16; the kernel runs a straight `tl.dot`.
     q_bf16 = q.to(torch.bfloat16)
