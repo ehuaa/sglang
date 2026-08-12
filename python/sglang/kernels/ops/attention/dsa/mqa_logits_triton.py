@@ -21,8 +21,17 @@ import triton.language as tl
 # Paged decode: num_warps=4 dominated on A100/SM80 across {2,4,8}; the others
 # were 1.5-1.7x slower at (num_heads=32, head_dim=128, block_size=64), so
 # narrow the sweep to keep autotune from latching onto a bad pick under noise.
+#
+# That measurement was at num_heads=32. At num_heads=64 (DeepSeek-V4-Flash) the
+# ranking inverts and num_warps=2 wins at every batch, holding NUM_SPLITS=64:
+# 1.26x at bs=1/ctx=128K, 1.06x at bs=8, 1.10x at bs=32, 1.11x at bs=32/ctx=1M,
+# 1.12x at bs=128. num_warps=8 stays 0.85x throughout even though it is the only
+# variant that lifts occupancy (25% vs 12%) -- this kernel wants registers per
+# thread, not warps per SM, same as the prefill kernel. So keep 2 in the list and
+# let autotune rank per (num_heads, head_dim, block_size); num_heads=32 still
+# picks 4 on its own.
 _PAGED_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=4, num_stages=ns) for ns in (2, 4)
+    triton.Config({}, num_warps=nw, num_stages=ns) for nw in (2, 4) for ns in (2, 4)
 ]
 
 # Grid axis 1 of the paged decode kernel. Each of the NUM_SPLITS programs per
