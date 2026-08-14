@@ -76,6 +76,54 @@ def _e4m3_scaled(b, sc):
     return tl.where((b >> 7) & 1 == 1, -v, v)
 
 
+# Fixed half of the E4M3 exponent correction in _e4m3_fast. The split point is
+# not arbitrary: it is the only one that both keeps every intermediate normal
+# and puts the saturation point exactly where _e4m3_scaled's clamp puts it.
+_E4M3_FIXED_EXP_MUL = tl.constexpr(float(2.0**112))
+# Per-token factor is 2^(sc - 119); 112 + (sc - 119) = sc - 7.
+_E4M3_SCALE_BIAS = tl.constexpr(119)
+# 2^(246-119) = 2^127, the largest finite factor.
+_E4M3_SCALE_MAX = tl.constexpr(246)
+
+
+@triton.jit
+def _e4m3_fast(b, scale_bf16):
+    """Decode E4M3 and apply its E8M0 block scale in 5 int ops + 2 multiplies.
+
+    _e4m3_scaled assembles the final exponent arithmetically, which costs a
+    clamp pair and a whole subnormal branch per element (~23 ops). Instead drop
+    the byte into the exponent field of a float whose bias is off by a constant:
+    the assembled value is e4m3 shifted down by 2^120, so multiplying fixes the
+    bias and applies the block scale together -- normals, subnormals, zero and
+    sign all fall out of the same expression, no branches, no per-element clamp.
+
+    The assembly is done in 16 bits and bitcast to bfloat16 rather than built in
+    float32, which is Marlin's fast_dequant_f8f16x4 packing (__byte_perm feeding
+    __hmul2 on a bfloat16x2) expressed without inline PTX: SM80 then issues the
+    corrections as HMUL2, two elements per instruction. Measured in this kernel
+    it ties the float32 form (0.6709 vs 0.6703 ms) because dequant stopped being
+    the limiter once _e4m3_scaled was gone, but in the sibling indexer
+    (mqa_logits_triton) the same change is worth a further 1.09x, so both use
+    this form.
+
+    The correction 2^(sc-7) is carried as a compile-time 2^112 times a per-token
+    2^(sc-119) rather than one factor, because a single 2^(sc-7) overflows even
+    float32 once sc > 134, and an inf here becomes NaN the moment it meets a
+    p=0 lane in the PV dot. Keeping the fixed half as a constant also means only
+    one broadcast scale tensor: two of them raised the autotuner's shared-memory
+    request past what an A100 block can hold.
+
+    2^112 was chosen so every intermediate stays normal and so the per-token
+    factor saturates at sc = 246, the same point _e4m3_scaled reaches by
+    clamping exp_n to 254. Requires bfloat16 subnormals to survive (an e4m3
+    subnormal assembles to one near 2^-129); verified on SM80, and verified
+    equal to _e4m3_scaled for every (byte, scale) pair with sc <= 246.
+    """
+    bits = (((b & 0x80) << 8) | ((b & 0x7F) << 4)).to(tl.int16)
+    v = bits.to(tl.bfloat16, bitcast=True) * _E4M3_FIXED_EXP_MUL
+    return v * scale_bf16
+
+
 @triton.jit
 def _e4m3_to_f32(b):
     """Decode E4M3 (float8_e4m3fn) to float32 with bit arithmetic, no LUT.
@@ -281,22 +329,23 @@ def _tiled_sparse_decode_kernel_mh(
             mask=idx_valid[:, None],
             other=127,
         )  # [BLOCK_T, 8]
-        scale_raw = tl.reshape(
-            tl.broadcast_to(s8[:, :, None], (BLOCK_T, 8, NOPE_PAD // 4 // 8)),
+        # Turn the 8 scale bytes into the float factor _e4m3_fast wants BEFORE
+        # broadcasting: 8 exp2 per token instead of 128, and the clamp that
+        # keeps the product finite costs one op per 16 elements rather than one
+        # per element.
+        sc_c = tl.minimum(tl.maximum(s8.to(tl.int32), 0), _E4M3_SCALE_MAX)
+        scale8 = tl.math.exp2((sc_c - _E4M3_SCALE_BIAS).to(tl.float32)).to(tl.bfloat16)
+        sc_f = tl.reshape(
+            tl.broadcast_to(scale8[:, :, None], (BLOCK_T, 8, NOPE_PAD // 4 // 8)),
             (BLOCK_T, NOPE_PAD // 4),
         )
-        # Tried replacing exp2 with bit assembly here (2^(s-127) is just s in the
-        # exponent field): measurably slower, 10.58 -> 12.05 ms. exp2 is a single
-        # ex2.approx instruction in hardware, so assembling bits adds work.
-        # The scale goes straight into the exponent field, no exp2.
-        sc_i = scale_raw.to(tl.int32)  # [BLOCK_T, 128]
 
         # Zero the tail past 448: element 4m+j < 448 iff m < 112 (448/4).
         # Folding this into the scale to save 4 wheres was also slower; reverted.
-        kv0 = _e4m3_scaled(b0, sc_i).to(tl.bfloat16)
-        kv1 = _e4m3_scaled(b1, sc_i).to(tl.bfloat16)
-        kv2 = _e4m3_scaled(b2, sc_i).to(tl.bfloat16)
-        kv3 = _e4m3_scaled(b3, sc_i).to(tl.bfloat16)
+        kv0 = _e4m3_fast(b0, sc_f)
+        kv1 = _e4m3_fast(b1, sc_f)
+        kv2 = _e4m3_fast(b2, sc_f)
+        kv3 = _e4m3_fast(b3, sc_f)
 
         rope_base_ptrs = cache_bf16_ptr + ((token_data_bases + 448) // 2)
         kv_rope = tl.load(
@@ -513,22 +562,23 @@ def _tiled_sparse_decode_kernel_split(
             mask=idx_valid[:, None],
             other=127,
         )  # [BLOCK_T, 8]
-        scale_raw = tl.reshape(
-            tl.broadcast_to(s8[:, :, None], (BLOCK_T, 8, NOPE_PAD // 4 // 8)),
+        # Turn the 8 scale bytes into the float factor _e4m3_fast wants BEFORE
+        # broadcasting: 8 exp2 per token instead of 128, and the clamp that
+        # keeps the product finite costs one op per 16 elements rather than one
+        # per element.
+        sc_c = tl.minimum(tl.maximum(s8.to(tl.int32), 0), _E4M3_SCALE_MAX)
+        scale8 = tl.math.exp2((sc_c - _E4M3_SCALE_BIAS).to(tl.float32)).to(tl.bfloat16)
+        sc_f = tl.reshape(
+            tl.broadcast_to(scale8[:, :, None], (BLOCK_T, 8, NOPE_PAD // 4 // 8)),
             (BLOCK_T, NOPE_PAD // 4),
         )
-        # Tried replacing exp2 with bit assembly here (2^(s-127) is just s in the
-        # exponent field): measurably slower, 10.58 -> 12.05 ms. exp2 is a single
-        # ex2.approx instruction in hardware, so assembling bits adds work.
-        # The scale goes straight into the exponent field, no exp2.
-        sc_i = scale_raw.to(tl.int32)  # [BLOCK_T, 128]
 
         # Zero the tail past 448: element 4m+j < 448 iff m < 112 (448/4).
         # Folding this into the scale to save 4 wheres was also slower; reverted.
-        kv0 = _e4m3_scaled(b0, sc_i).to(tl.bfloat16)
-        kv1 = _e4m3_scaled(b1, sc_i).to(tl.bfloat16)
-        kv2 = _e4m3_scaled(b2, sc_i).to(tl.bfloat16)
-        kv3 = _e4m3_scaled(b3, sc_i).to(tl.bfloat16)
+        kv0 = _e4m3_fast(b0, sc_f)
+        kv1 = _e4m3_fast(b1, sc_f)
+        kv2 = _e4m3_fast(b2, sc_f)
+        kv3 = _e4m3_fast(b3, sc_f)
 
         rope_base_ptrs = cache_bf16_ptr + ((token_data_bases + 448) // 2)
         kv_rope = tl.load(

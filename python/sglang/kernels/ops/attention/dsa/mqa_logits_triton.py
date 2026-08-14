@@ -9,9 +9,9 @@ SGLang's index-K cache layout matches what these kernels expect: per block,
 `block_size * head_dim` FP8 K bytes followed by `block_size * 4` fp32 scale
 bytes, exposed as `[num_blocks, block_size, 1, head_dim + 4]` uint8 (head_dim
 128 -> 132). SM80 Triton cannot `tl.load` fp8e4nv directly, so the paged decode
-kernel decodes FP8 -> bf16 through a 256-entry LUT; the prefill kernel
-pre-decodes q/k to bf16 in the wrapper (compute-bound, LUT contends with the
-matmul there).
+kernel decodes FP8 -> bf16 with bit arithmetic (`_decode_e4m3fn_bf16`); the
+prefill kernel pre-decodes q/k to bf16 in the wrapper (it is compute-bound, so
+the conversion is better hoisted out of the matmul entirely).
 """
 
 import torch
@@ -101,27 +101,36 @@ _PREFILL_WARMUP_M = 4096
 _PREFILL_WARMUP_N = 8192
 
 
-_E4M3FN_BF16_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
-
-
-def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
-    lut = _E4M3FN_BF16_LUT_CACHE.get(device)
-    if lut is not None:
-        return lut
-    lut = (
-        torch.arange(256, dtype=torch.uint8, device=device)
-        .view(torch.float8_e4m3fn)
-        .to(torch.bfloat16)
-    )
-    lut[0x7F] = 480.0
-    lut[0xFF] = -480.0
-    _E4M3FN_BF16_LUT_CACHE[device] = lut
-    return lut
+# Bias that turns the assembled exponent field into E4M3's: an e4m3 byte dropped
+# into float32 bits [30:20] reads as 2^(e-127)*1.m, and e4m3 wants 2^(e-7)*1.m.
+_E4M3_BIAS_MUL = tl.constexpr(float(2.0**120))
 
 
 @triton.jit
-def _decode_e4m3fn_bf16_lut(u, lut_ptr):
-    return tl.load(lut_ptr + u.to(tl.uint32))
+def _decode_e4m3fn_bf16(u):
+    """E4M3 byte -> bfloat16 by bit assembly plus one multiply.
+
+    Replaces a 256-entry lookup table. The table looked cheap -- one load per
+    element -- but every lane indexes a different entry, so the gather
+    serialises; the sibling sparse-decode kernel measured the same table at 65%
+    of its runtime (15.02 -> 5.28 ms once removed, see
+    flash_mla_sm120_triton._e4m3_to_f32).
+
+    Behaviour matches the table exactly, including its NaN quirk: the table was
+    built by casting 0..255 through float8_e4m3fn and then overwriting the two
+    NaN encodings with +-480, and 0x7F assembles here to
+    2^(15-127)*1.875 * 2^120 = +480 (0xFF to -480) for the same reason. Sign,
+    normals and subnormals all fall out of the one expression -- a subnormal
+    assembles to a float32 subnormal near 2^-129, which the multiply
+    renormalises.
+    """
+    # Assemble in 16 bits and bitcast straight to bfloat16 -- Marlin's packing
+    # (__byte_perm feeding __hmul2 on a bfloat16x2), which SM80 issues two
+    # elements per instruction. Widen to int16 first: the loads hand back uint8
+    # and a bitcast needs matching widths.
+    b = u.to(tl.int16)
+    bits = ((b & 0x80) << 8) | ((b & 0x7F) << 4)
+    return bits.to(tl.bfloat16, bitcast=True) * _E4M3_BIAS_MUL
 
 
 @triton.autotune(
@@ -134,7 +143,6 @@ def _fp8_paged_mqa_logits_kernel(
     kv_fp8_ptr,
     kv_scale_ptr,
     weights_ptr,
-    fp8_lut_ptr,
     context_lens_ptr,
     block_tables_ptr,
     logits_ptr,
@@ -185,7 +193,7 @@ def _fp8_paged_mqa_logits_kernel(
         mask=mask_h[:, None] & mask_d[None, :],
         other=0,
     )
-    q = _decode_e4m3fn_bf16_lut(q_byte, fp8_lut_ptr)
+    q = _decode_e4m3fn_bf16(q_byte)
     w = tl.load(
         weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
         mask=mask_h,
@@ -210,7 +218,7 @@ def _fp8_paged_mqa_logits_kernel(
             mask=mask_n,
             other=0.0,
         )
-        k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
+        k = _decode_e4m3fn_bf16(k_byte)
         # Scale in fp32 after the dot to avoid an extra bf16 round-trip on K.
         s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
 
@@ -289,14 +297,12 @@ def fp8_paged_mqa_logits_triton(
     BLOCK_D = triton.next_power_of_2(head_dim)
     BLOCK_N = triton.next_power_of_2(block_size)
 
-    fp8_lut = _get_e4m3fn_bf16_lut(q.device)
     grid = (B * next_n, _PAGED_NUM_SPLITS)
     _fp8_paged_mqa_logits_kernel[grid](
         q_byte,
         kv_byte,
         kv_scale,
         weights,
-        fp8_lut,
         context_lens,
         block_tables,
         logits,
