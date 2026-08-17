@@ -55,6 +55,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -456,10 +457,11 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
+        self.force_marlin = False
         if _is_cuda:
-            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            self.force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
-            self.use_marlin = force_marlin or auto_enable
+            self.use_marlin = self.force_marlin or auto_enable
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
@@ -480,6 +482,21 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+
+        # sm8x has no FP8 tensor cores, so Marlin dequantizes to bf16 and runs
+        # bf16 mma anyway -- the only thing it buys is holding the weights in
+        # fp8. Dequantizing once at load and calling cuBLAS instead measured
+        # 4.9x faster at DSv4 decode shapes (m=288) on A100 and still 1.3x at
+        # prefill (m=8192). Restricted to the block-quant path: the per-tensor
+        # and channelwise paths reshape scales differently under use_marlin, and
+        # they are not what the FP8 checkpoints we serve on sm8x use.
+        self.dequant_to_bf16 = (
+            self.use_marlin
+            and not self.force_marlin
+            and self.block_quant
+            and not self.use_mxfp8
+            and envs.SGLANG_OPT_FP8_LINEAR_DEQUANT_BF16.get()
+        )
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -947,12 +964,32 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-        if self.use_marlin:
+        if self.dequant_to_bf16:
+            self._dequant_block_fp8_weight_to_bf16(layer)
+        elif self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
+
+    def _dequant_block_fp8_weight_to_bf16(self, layer: Module) -> None:
+        """Replace the block-quantized fp8 weight with its dequantization.
+
+        The result is what Marlin would have reconstructed inside the kernel on
+        every call, so the GEMM becomes a plain cuBLAS matmul on the layer's
+        original dtype.
+        """
+        weight = block_quant_dequant(
+            layer.weight.data,
+            layer.weight_scale_inv.data.to(torch.float32),
+            block_size=self.weight_block_size,
+            dtype=layer.orig_dtype,
+        )
+        layer.weight = Parameter(weight, requires_grad=False)
+        del layer.weight_scale_inv
+        # Activations are not quantized on this path.
+        layer.input_scale = None
 
     def apply(
         self,
@@ -960,6 +997,9 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.dequant_to_bf16:
+            return F.linear(x, layer.weight, bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

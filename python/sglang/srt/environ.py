@@ -1491,6 +1491,15 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Where FP8 Marlin would be used (sm8x, which has no FP8 tensor cores),
+    # dequantize block-quantized FP8 linear weights to bf16 once at load and run
+    # a plain cuBLAS matmul instead. Marlin dequantizes to bf16 inside the kernel
+    # on every call anyway, so the only thing it buys is holding the weights in
+    # fp8. Costs ~2x the weight bytes for the affected layers. Set to 0 when that
+    # memory matters more than the GEMM time.
+    SGLANG_OPT_FP8_LINEAR_DEQUANT_BF16 = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory
