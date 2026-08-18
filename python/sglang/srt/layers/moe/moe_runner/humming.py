@@ -5,7 +5,7 @@ import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
-from weakref import WeakValueDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 import torch
 
@@ -49,6 +49,18 @@ try:
     _humming_available = True
 except ModuleNotFoundError:
     _humming_available = False
+
+
+if _humming_available:
+    # Rebuilding this per call cost a DataType hash (which formats a repr) for
+    # every key, on a path that runs once per MoE layer per forward.
+    _TORCH_DTYPE_MAP = {
+        dtypes.float16: torch.float16,
+        dtypes.bfloat16: torch.bfloat16,
+        dtypes.float8e4m3: torch.float8_e4m3fn,
+        dtypes.int8: torch.int8,
+        dtypes.int4: torch.uint8,
+    }
 
 
 def get_standard_humming_moe_gemm_type() -> HummingGemmType:
@@ -136,6 +148,14 @@ def humming_moe_runner_core_run(
 class HummingRunnerCore(MoeRunnerCore):
     runner_cores: WeakValueDictionary = WeakValueDictionary()
 
+    # The gemm configs are a pure function of the layer's humming metas (frozen
+    # after weight loading) and the gemm type, but fused_experts_none_to_humming
+    # builds a fresh runner core for every MoE layer of every forward, so a
+    # per-core cache never hits and every call re-ran json.dumps over the full
+    # ranged tuning-config list (~2.7 KB per sublayer). Key the cache on the
+    # layer, which outlives the forward.
+    gemm_configs: WeakKeyDictionary = WeakKeyDictionary()
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         assert config.num_local_experts is not None
@@ -145,7 +165,6 @@ class HummingRunnerCore(MoeRunnerCore):
         self.activation = config.activation
         self.swiglu_limit = config.swiglu_limit
         self.layer: torch.nn.Module | None = None
-        self.humming_gemm_configs = {}
         HummingRunnerCore.runner_cores[id(self)] = self
 
     @property
@@ -153,8 +172,9 @@ class HummingRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.HUMMING
 
     def get_humming_gemm_configs(self, humming_gemm_type: HummingGemmType):
-        if humming_gemm_type.value in self.humming_gemm_configs:
-            return self.humming_gemm_configs[humming_gemm_type.value]
+        layer_configs = HummingRunnerCore.gemm_configs.setdefault(self.layer, {})
+        if humming_gemm_type.value in layer_configs:
+            return layer_configs[humming_gemm_type.value]
 
         compute_config = {
             "use_f16_accum": envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
@@ -172,7 +192,7 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=humming_gemm_type,
             sublayer_name="w2",
         )
-        self.humming_gemm_configs[humming_gemm_type.value] = {
+        layer_configs[humming_gemm_type.value] = {
             "compute_config": compute_config,
             "w13_tuning_config": w13_tuning_config,
             "w2_tuning_config": w2_tuning_config,
@@ -181,7 +201,7 @@ class HummingRunnerCore(MoeRunnerCore):
             "w2_tuning_config_str": json.dumps(w2_tuning_config),
         }
 
-        return self.humming_gemm_configs[humming_gemm_type.value]
+        return layer_configs[humming_gemm_type.value]
 
     def estimate_local_valid_shape_m(
         self,
@@ -239,13 +259,7 @@ class HummingRunnerCore(MoeRunnerCore):
         a_dtype = self.layer.humming_metas["w13"].a_dtype
         c_dtype = self.layer.humming_metas["w13"].c_dtype
         num_bits = a_dtype.num_bits
-        torch_dtype_map = {
-            dtypes.float16: torch.float16,
-            dtypes.bfloat16: torch.bfloat16,
-            dtypes.float8e4m3: torch.float8_e4m3fn,
-            dtypes.int8: torch.int8,
-            dtypes.int4: torch.uint8,
-        }
+        torch_dtype_map = _TORCH_DTYPE_MAP
 
         buffer_metas = {
             "quanted_gate_up_input": {
@@ -298,16 +312,10 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def _workspace_shapes(
         self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        buffer_metas: dict,
+        required_buffers: list[str],
         gemm_type: HummingGemmType,
     ):
-        buffer_metas, required_buffers = self.get_buffer_metas(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            gemm_type=gemm_type,
-        )
-
         workspace1_nbytes = 0
         workspace2_nbytes = 0
 
@@ -329,14 +337,18 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def make_workspaces(
         self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        buffer_metas: dict,
+        required_buffers: list[str],
         gemm_type: HummingGemmType,
+        device: torch.device,
     ):
-        shapes = self._workspace_shapes(hidden_states, topk_ids, gemm_type)
+        shapes = self._workspace_shapes(
+            buffer_metas=buffer_metas,
+            required_buffers=required_buffers,
+            gemm_type=gemm_type,
+        )
         workspace1_shape, workspace2_shape, output_shape = shapes
         torch_dtype = self.layer.params_dtype
-        device = hidden_states.device
         workspace1 = torch.empty(workspace1_shape, dtype=torch_dtype, device=device)
         workspace2 = torch.empty(workspace2_shape, dtype=torch_dtype, device=device)
         output = workspace1[: math.prod(output_shape)].view(*output_shape)
@@ -348,15 +360,19 @@ class HummingRunnerCore(MoeRunnerCore):
         topk_ids: torch.Tensor,
         gemm_type: HummingGemmType,
     ) -> dict[str, torch.Tensor]:
-        workspace1, workspace2, output = self.make_workspaces(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            gemm_type=gemm_type,
-        )
+        # get_buffer_metas() used to run twice per call -- once here and once
+        # again underneath make_workspaces() -- and it is not cheap: it hashes
+        # humming DataType objects, whose __hash__ formats a repr.
         buffer_metas, required_buffers = self.get_buffer_metas(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             gemm_type=gemm_type,
+        )
+        workspace1, workspace2, output = self.make_workspaces(
+            buffer_metas=buffer_metas,
+            required_buffers=required_buffers,
+            gemm_type=gemm_type,
+            device=hidden_states.device,
         )
         buffers = {"output": output}
         for index, name in enumerate(required_buffers[::-1]):
