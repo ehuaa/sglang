@@ -235,14 +235,20 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
     if global_num_experts == -1:
         global_num_experts = E
+
+    # M block size selection logic
+    # TODO: tune this further for specific models
+    # Rows per expert is total pairs over *global* experts. Under EP, E is only
+    # this rank's share of the experts while M * topk still counts every pair in
+    # the batch, so dividing by E overstates the per-expert row count by the EP
+    # degree and picks a tile that many steps too large (block 64 instead of 32
+    # at ep_size=8 on DSv4). Without EP the two are equal, so this is a no-op
+    # there.
+    for block_size_m in [8, 16, 32, 48, 64]:
+        if M * topk / global_num_experts / block_size_m < 0.9:
+            break
     if (
         M == 1
         and topk <= 32

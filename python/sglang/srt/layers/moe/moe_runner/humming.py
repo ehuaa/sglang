@@ -212,7 +212,22 @@ class HummingRunnerCore(MoeRunnerCore):
         if expected_m is not None:
             return expected_m * self.num_experts
 
-        # TODO: update for EP and DP
+        # Under EP this runner only computes the pairs whose expert is local,
+        # but topk_ids still carries every pair in the batch, so the raw
+        # element count overstates the work by the EP degree -- it picked a
+        # tile sized for 8x the rows at ep_size=8. Scale by the local share.
+        # Uniform routing is the right model here: this feeds tile selection
+        # and the kernel's shape_m, not an allocation, so a skewed batch just
+        # lands one bucket off rather than corrupting anything.
+        #
+        # TODO: still overstates under DP. _mask_topk_ids_padded_region() fills
+        # the rows past num_token_non_padded with -1 so moe_align skips them,
+        # but they are still counted here. Fixing that needs
+        # num_token_non_padded plumbed to the runner -- neither
+        # StandardTopKOutput nor StandardDispatchOutput carries it today.
+        if self.num_experts != self.global_num_experts:
+            local_share = topk_ids.nelement() * self.num_experts
+            return max(1, local_share // self.global_num_experts)
         return topk_ids.nelement()
 
     def get_buffer_metas(
