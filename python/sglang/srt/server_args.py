@@ -5880,6 +5880,14 @@ class ServerArgs:
                 # below SM90. Both then take their TileLang / v1 counterparts.
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                # The fused post+pre MHC path only has a DeepGEMM implementation
+                # and a fallback that hard-codes n_splits=1. With the prenorm
+                # flag off above, Ampere always takes that fallback: a 1-D grid
+                # of 6 blocks on 108 SMs, 97.7us against 10.4us for the split
+                # path. It costs a fixed ~1.2ms per decode step here, which is
+                # -18.7% output throughput at concurrency 8 and -6.3% at 48.
+                if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
+                    envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(False)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
