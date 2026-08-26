@@ -52,6 +52,16 @@ except ModuleNotFoundError:
 
 
 if _humming_available:
+    from sglang.srt.layers.moe.moe_runner.humming_sm80 import (
+        register_sm80_moe_heuristics,
+    )
+    from sglang.srt.utils import get_device_sm, is_cuda
+
+    if is_cuda() and get_device_sm() == 80:
+        # Must happen before the first get_heuristics_config call; that function
+        # is lru_cached, so registering later would be masked by its entries.
+        register_sm80_moe_heuristics()
+
     # Rebuilding this per call cost a DataType hash (which formats a repr) for
     # every key, on a path that runs once per MoE layer per forward.
     _TORCH_DTYPE_MAP = {
