@@ -300,6 +300,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
+                tp_sync=self._tp_sync,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -340,6 +341,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             kv_injector=self._kv_injector,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            tp_sync=self._tp_sync,
         )
 
         self._forced_budget_frac: Optional[float] = None
