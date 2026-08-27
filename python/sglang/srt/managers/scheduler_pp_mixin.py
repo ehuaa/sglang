@@ -1159,7 +1159,17 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            DSparkPPVerifyInputRaw,
+        )
         from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+
+        def _pp_raw_cls():
+            # Dispatch the PP relay carrier class by algorithm so the non-last
+            # ranks rebuild the correct spec_info type from pp_outputs.
+            if self.spec_algorithm.is_dspark():
+                return DSparkPPVerifyInputRaw
+            return EaglePPVerifyInputRaw
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1185,15 +1195,13 @@ class SchedulerPPMixin:
         batch.input_ids = next_token_ids
 
         if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
-            # Spec-v2 decode path: the last PP rank produced draft tokens for
-            # this iter; rebuild the raw draft tree so _build_verify_input_from_pp_raw
-            # can construct EagleVerifyInput on this rank.
-            batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
+            # Spec-v2 decode path: extract next iter's draft info from pp_outputs.
+            batch.spec_info = _pp_raw_cls().from_pp_outputs(pp_outputs)
         elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
             if batch.contains_last_prefill_chunk:
                 # The last PP rank produces no draft tokens for prefill batches;
                 # build a dummy draft for the first decode step.
-                batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+                batch.spec_info = _pp_raw_cls().build_dummy_for_decode(
                     batch, self.server_args.speculative_num_draft_tokens
                 )
             else:
@@ -1221,7 +1229,7 @@ class SchedulerPPMixin:
         )
         output_result.copy_auxiliary_output_to_cpu()
 
-        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
@@ -1296,9 +1304,12 @@ class SchedulerPPMixin:
         # adjacent pair has one sender and one receiver posted at the
         # same time.
 
-        if self.spec_algorithm == SpeculativeAlgorithm.EAGLE:
-            # PP+MTP: every rank sending first deadlocks on CUDA, so even
-            # ranks send first instead.
+        if self.spec_algorithm in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            # PP+spec (EAGLE/DSPark): every rank sending first deadlocks
+            # on CUDA, so even ranks send first instead.
             send_first = (self.ps.pp_rank % 2) == 0
         else:
             # CUDA: send first
@@ -1353,6 +1364,7 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                cur_batch.pp_mb_id = mb_id
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",

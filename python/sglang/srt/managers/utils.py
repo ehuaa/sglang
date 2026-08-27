@@ -22,11 +22,13 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
+    from sglang.srt.speculative.dspark_components.dspark_verify import (
+        DSparkPPVerifyInputRaw,
+    )
     from sglang.srt.speculative.eagle_info import (
         EagleDraftInput,
         EaglePPVerifyInputRaw,
     )
-
 
 logger = logging.getLogger(__name__)
 
@@ -114,10 +116,12 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
-    # PP + Spec: produced by the last PP rank after draft/draft_extend_for_decode,
-    # consumed by _pp_prepare_tensor_dict for PP ring transmission so non-last PP
-    # ranks can rebuild EagleVerifyInput on the next iteration.
-    pp_verify_input_raw: Optional[EaglePPVerifyInputRaw] = None
+    # PP + Spec: produced by Last Rank after draft/draft_extend_for_prefill,
+    # consumed by _pp_prepare_tensor_dict for PP ring transmission. Eagle uses
+    # EaglePPVerifyInputRaw, DSpark uses DSparkPPVerifyInputRaw.
+    pp_verify_input_raw: Optional[
+        Union[EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw]
+    ] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:

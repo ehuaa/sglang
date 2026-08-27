@@ -2,14 +2,14 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
@@ -32,40 +32,34 @@ def _get_overlap_plan_stream(
     return stream, torch.get_device_module(device_str).stream(stream)
 
 
-@dataclass
-class DFlashDraftInputV2(SpecInput):
-    """Draft-side state carried across overlap iterations (spec-v2)."""
+class DFlashDecodePrepareMixin:
+    """Shared prepare_for_decode for DFLASH-family spec inputs.
 
-    # Legacy Eagle-shaped fields; DFLASH relays via FutureMap so these are unused.
-    topk_p: torch.Tensor
-    topk_index: torch.Tensor
-    bonus_tokens: torch.Tensor
-    new_seq_lens: torch.Tensor
-    hidden_states: torch.Tensor
-    max_top_k: int = 1
-    uniform_top_k_value: Optional[int] = None
-    nxt_kv_lens_cpu: Optional[torch.Tensor] = None
-    nxt_kv_lens_sum: Optional[int] = None
-    _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
-    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    Both DFlashDraftInputV2 (single-rank / PP last rank) and
+    DSparkPPVerifyInputRaw (PP non-last rank) mix this in so every rank holding
+    a DFLASH spec input runs the same verify-block KV pre-allocation. The PP
+    non-last rank's verify forward also gathers verify_cache_loc from
+    req_to_token, so it must pre-allocate like the last rank.
 
-    # Filled by scheduler after dispatch.
-    future_indices: Optional[torch.Tensor] = None
+    Subclasses must expose `reserved_seq_lens_cpu` / `reserved_seq_lens_sum`
+    attributes (written here, read by filter_batch/merge_batch). The scratch
+    buffers are lazily initialized on first use so dataclass subclasses don't
+    have to declare them as fields.
+    """
 
-    verify_token_budget: Optional[int] = None
-
-    def __post_init__(self):
-        super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
-        # Spec v2 draft state itself does not change token accounting.
-        self.num_tokens_per_req = 1
-        self.num_tokens_for_logprob_per_req = 1
+    def _ensure_prepare_bufs(self) -> None:
+        if not getattr(self, "_prepare_bufs_inited", False):
+            self._prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+            self._prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+            self._prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+            self._prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+            self._prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+            self._prepare_bufs_inited = True
 
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
     ) -> None:
+        self._ensure_prepare_bufs()
         pin_memory = is_pin_memory_available(device)
 
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
@@ -101,16 +95,6 @@ class DFlashDraftInputV2(SpecInput):
                 (capacity,), dtype=torch.int32, device=device
             )
 
-    @classmethod
-    def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
-        return cls(
-            topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
-            topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
-            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
-            hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
-        )
-
     def prepare_for_decode(self, batch: ScheduleBatch):
         """Allocate headroom in the shared req_to_token pool for the next DFLASH step.
 
@@ -136,7 +120,6 @@ class DFlashDraftInputV2(SpecInput):
         assert self._prepare_nxt_kv_lens_gpu_buf is not None
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
-        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_spec().speculative_num_draft_tokens)
@@ -153,30 +136,35 @@ class DFlashDraftInputV2(SpecInput):
             page_size=page_size,
         )
 
+        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
+        committed_seq_lens_sum = 0
+        reserved_seq_lens_sum = 0
+        # top_k tracking is only used by DFlashDraftInputV2's accept path; PP raw
+        # does not carry these fields, so gate the write-back on attribute presence.
+        track_top_k = hasattr(self, "max_top_k")
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
-        nxt_kv_lens_sum = 0
-        committed_seq_lens_sum = 0
-        for i, (req, cur, nxt) in enumerate(zip(batch.reqs, cur_kv_lens, nxt_kv_lens)):
+        for i, (req, cur_alloc_len, reserved_len) in enumerate(
+            zip(batch.reqs, cur_kv_lens, nxt_kv_lens)
+        ):
             committed_len = int(req.kv_committed_len)
-            committed_seq_lens_sum += committed_len
-            top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur
-            nxt_kv_lens_cpu_t[i] = nxt
+            cur_kv_lens_cpu_t[i] = cur_alloc_len
+            nxt_kv_lens_cpu_t[i] = reserved_len
 
-            nxt_kv_lens_sum += nxt
-            if top_k > max_top_k:
-                max_top_k = top_k
-            if i == 0:
-                uniform_top_k_value = top_k
-            elif uniform_top_k and top_k != uniform_top_k_value:
-                uniform_top_k = False
+            committed_seq_lens_sum += committed_len
+            reserved_seq_lens_sum += reserved_len
 
-        self.max_top_k = max(max_top_k, 1)
-        self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
+            if track_top_k:
+                top_k = int(req.sampling_params.top_k)
+                if top_k > max_top_k:
+                    max_top_k = top_k
+                if i == 0:
+                    uniform_top_k_value = top_k
+                elif uniform_top_k and top_k != uniform_top_k_value:
+                    uniform_top_k = False
 
         caller_stream = None
         if plan_stream is not None:
@@ -216,20 +204,66 @@ class DFlashDraftInputV2(SpecInput):
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
         batch.seq_lens_sum = committed_seq_lens_sum
-        self.nxt_kv_lens_cpu = nxt_kv_lens_cpu_t
-        self.nxt_kv_lens_sum = nxt_kv_lens_sum
+        self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
+        self.reserved_seq_lens_sum = reserved_seq_lens_sum
+        if track_top_k:
+            self.max_top_k = max(max_top_k, 1)
+            self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
+
+
+@dataclass
+class DFlashDraftInputV2(DFlashDecodePrepareMixin, SpecInput):
+    """Draft-side state carried across overlap iterations (spec-v2)."""
+
+    # Legacy Eagle-shaped fields; DFLASH relays via FutureMap so these are unused.
+    topk_p: torch.Tensor
+    topk_index: torch.Tensor
+    bonus_tokens: torch.Tensor
+    new_seq_lens: torch.Tensor
+    hidden_states: torch.Tensor
+    max_top_k: int = 1
+    uniform_top_k_value: Optional[int] = None
+    reserved_seq_lens_cpu: Optional[torch.Tensor] = None
+    reserved_seq_lens_sum: Optional[int] = None
+
+    # Filled by scheduler after dispatch.
+    future_indices: Optional[torch.Tensor] = None
+
+    verify_token_budget: Optional[int] = None
+
+    def __post_init__(self):
+        super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
+        # Spec v2 draft state itself does not change token accounting.
+        self.num_tokens_per_req = 1
+        self.num_tokens_for_logprob_per_req = 1
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        # Spec v2 draft state itself does not change token accounting.
+        return (1, 1)
+
+    @classmethod
+    def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
+        return cls(
+            topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
+            hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
+        )
 
     def filter_batch(
         self,
         new_indices: torch.Tensor,
         new_indices_cpu: Optional[List[int]] = None,
     ):
-        if self.nxt_kv_lens_cpu is not None:
+        if self.reserved_seq_lens_cpu is not None:
             if new_indices_cpu is not None:
-                self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices_cpu]
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
             else:
-                self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
-            self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
+                    new_indices.cpu()
+                ]
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
@@ -242,15 +276,15 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
-        if self.nxt_kv_lens_cpu is not None:
-            assert spec_info.nxt_kv_lens_cpu is not None
-            self.nxt_kv_lens_cpu = torch.cat(
-                [self.nxt_kv_lens_cpu, spec_info.nxt_kv_lens_cpu]
+        if self.reserved_seq_lens_cpu is not None:
+            assert spec_info.reserved_seq_lens_cpu is not None
+            self.reserved_seq_lens_cpu = torch.cat(
+                [self.reserved_seq_lens_cpu, spec_info.reserved_seq_lens_cpu]
             )
-            self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
-        elif spec_info.nxt_kv_lens_cpu is not None:
-            self.nxt_kv_lens_cpu = spec_info.nxt_kv_lens_cpu
-            self.nxt_kv_lens_sum = spec_info.nxt_kv_lens_sum
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+        elif spec_info.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
+            self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None

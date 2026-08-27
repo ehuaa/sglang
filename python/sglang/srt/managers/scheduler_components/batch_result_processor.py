@@ -867,6 +867,10 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            DSparkPPVerifyInputRaw,
+        )
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
@@ -906,18 +910,41 @@ class SchedulerBatchResultProcessor:
 
         accept_lens = None
         accept_lens_cpu = None
-        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             pp_raw = batch.spec_info
-            accept_lens = pp_raw.accept_lens.to(torch.int64)
-            accept_lens_cpu = accept_lens.cpu()
-            if pp_raw.accept_index is not None:
-                accept_index = pp_raw.accept_index.to(torch.long)
-                move_accept_tokens_to_target_kvcache(
-                    batch,
-                    accept_index,
-                    accept_lens - 1,
-                    self.model_worker.token_to_kv_pool_allocator,
+            if isinstance(pp_raw, DSparkPPVerifyInputRaw):
+                # Linear verify relays tensors across PP ranks; accept_index
+                # stays None so no target KV token-move is needed.
+                accept_lens = pp_raw.accept_lens.to(torch.int64)
+                accept_lens_cpu = accept_lens.cpu()
+                # Kimi-K3 hybrid mamba: commit mamba states after the verify.
+                self.model_worker.commit_pp_mamba_states_after_verify(
+                    batch=batch,
+                    commit_lens=accept_lens,
                 )
+            else:
+                accept_lens = pp_raw.accept_lens.to(torch.int64)
+                accept_lens_cpu = accept_lens.cpu()
+                accept_index = (
+                    pp_raw.accept_index.to(torch.long)
+                    if pp_raw.accept_index is not None
+                    else None
+                )
+                # Hybrid-mamba target: commit mamba states after the PP verify.
+                draft_token_num, _ = pp_raw.get_spec_adjust_token_coefficient()
+                self.model_worker.commit_pp_mamba_states_after_verify(
+                    batch=batch,
+                    accept_lens=accept_lens,
+                    accept_index=accept_index,
+                    draft_token_num=draft_token_num,
+                )
+                if accept_index is not None:
+                    move_accept_tokens_to_target_kvcache(
+                        batch,
+                        accept_index,
+                        accept_lens - 1,
+                        self.model_worker.token_to_kv_pool_allocator,
+                    )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -990,7 +1017,10 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
-        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+        # PP speculative decode: advance seq_lens to post-iter (accept_lens added
+        # per req). KV release above must finish first since it reads pre-iter
+        # seq_lens; accept_lens covers both topk == 1 (bonus only) and topk > 1.
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             batch.seq_lens = batch.seq_lens + accept_lens
             if batch.seq_lens_cpu is not None:
                 batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
