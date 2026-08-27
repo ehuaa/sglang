@@ -43,6 +43,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
 
@@ -1037,6 +1038,14 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+
+        # PP + spec: the last PP rank serializes the draft tree so non-last ranks
+        # can rebuild EagleVerifyInput on the next iter. Nested under
+        # 'pp_spec_output' and flattened by _split_tensor_dict so the tensors
+        # travel over the GPU channel.
+        if result.pp_verify_input_raw:
+            tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
+
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1150,6 +1159,7 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1172,13 +1182,35 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
-        )
-        batch.input_ids = None
+        batch.input_ids = next_token_ids
+
+        if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
+            # Spec-v2 decode path: the last PP rank produced draft tokens for
+            # this iter; rebuild the raw draft tree so _build_verify_input_from_pp_raw
+            # can construct EagleVerifyInput on this rank.
+            batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
+        elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
+            if batch.contains_last_prefill_chunk:
+                # The last PP rank produces no draft tokens for prefill batches;
+                # build a dummy draft for the first decode step.
+                batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+                    batch, self.server_args.speculative_num_draft_tokens
+                )
+            else:
+                # Chunked prefill middle chunk: its next_token_ids is a
+                # placeholder that no consumer reads (the next iter is another
+                # extend and resolve_forward_inputs sources input_ids from the
+                # prefill staging copy). Do nothing here.
+                pass
+        else:
+            # PP rank 0 also relays into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+            )
+            batch.input_ids = None
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1188,6 +1220,12 @@ class SchedulerPPMixin:
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
         output_result.copy_auxiliary_output_to_cpu()
+
+        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+            output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
+            output_result.speculative_num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens
+            )
         return output_result
 
     def _pp_process_batch_result(
@@ -1258,9 +1296,14 @@ class SchedulerPPMixin:
         # adjacent pair has one sender and one receiver posted at the
         # same time.
 
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        if self.spec_algorithm == SpeculativeAlgorithm.EAGLE:
+            # PP+MTP: every rank sending first deadlocks on CUDA, so even
+            # ranks send first instead.
+            send_first = (self.ps.pp_rank % 2) == 0
+        else:
+            # CUDA: send first
+            # XPU: even ranks send first, odd ranks recv first.
+            send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
