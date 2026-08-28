@@ -1227,13 +1227,24 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
-        output_result.copy_auxiliary_output_to_cpu()
 
         if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
             )
+
+        # Async copy the CPU-bound fields ahead of time; d2h_event in the
+        # caller guarantees completion before the result is consumed.
+        # copy_to_cpu also covers the auxiliary output, which the non-PP path
+        # copies in Scheduler._copy_auxiliary_output_to_cpu (skipped when
+        # pp_size > 1 because PP transports it to the first rank first).
+        output_result.copy_done = self.device_module.Event()
+        output_result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=False,
+        )
+
         return output_result
 
     def _pp_process_batch_result(
