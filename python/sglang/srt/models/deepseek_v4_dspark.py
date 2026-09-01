@@ -554,11 +554,20 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
                 raise ValueError(
                     "DSpark needs target layers for the target-hidden projection."
                 )
+            # main_proj runs on the per-DP-rank token buffer, so under DP
+            # attention `gather_output`'s tensor_model_parallel_all_gather is
+            # issued over the tp group with a sendcount that differs per rank
+            # (each attention-DP rank holds its own token count) and NCCL
+            # deadlocks. Replicate the projection there instead, the same way
+            # embed_tokens drops TP below.
+            replicate_proj = is_dp_attention_enabled()
             self.main_proj = ColumnParallelLinear(
                 config.hidden_size * num_target_layers,
                 config.hidden_size,
                 bias=False,
-                gather_output=True,
+                gather_output=not replicate_proj,
+                tp_rank=0 if replicate_proj else None,
+                tp_size=1 if replicate_proj else None,
                 quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
