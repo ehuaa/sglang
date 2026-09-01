@@ -719,9 +719,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             pp_proxy_out = None
             if get_parallel().enable_dp_attention:
                 # The draft model lives only on the last PP rank.
-                if self._draft_is_moe and (
+                run_draft_idle = self._draft_is_moe and (
                     not self._pp_enabled or self._pp_is_last_rank
-                ):
+                )
+                # NCCL requires every rank to enqueue one communicator's ops in
+                # the same order. A busy peer proposes before it verifies when
+                # PP is off, but under PP the early propose is replaced by the
+                # relayed tree and the real one runs after accept_and_finalize,
+                # i.e. after the verify. Follow whichever order the busy peers
+                # use, or the idle and busy sides swap their draft and target
+                # collectives and the DP group deadlocks.
+                if run_draft_idle and not self._pp_enabled:
                     self._proposer.run_idle_participation(batch)
                 idle_out = self._verify_executor.run_idle_participation(
                     batch=batch,
@@ -729,6 +737,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
                 pp_proxy_out = idle_out.pp_hidden_states_proxy_tensors
+                if run_draft_idle and self._pp_enabled:
+                    self._proposer.run_idle_participation(batch)
             if self._pp_enabled and not self._pp_is_last_rank:
                 assert pp_proxy_out is not None, (
                     "non-last PP rank must relay proxy hidden downstream even "
