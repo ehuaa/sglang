@@ -105,4 +105,8 @@ def resolve_pp_proxy_dspark_num_layers(
     # Only layers in upstream ranks ([0, start_layer)) are relayed in; this
     # rank's own captures are produced locally and never arrive via the proxy.
     upstream = [lid for lid in target_layer_ids if lid < start_layer]
-    return len(upstream)
+    # None, not 0: both callers gate the buffer on `is not None`, so a zero here
+    # registers a zero-width "dspark_aux" graph slot. The sender only writes that
+    # key when it has parts to relay (deepseek_v4.py), so replay would index a
+    # key that never arrives.
+    return len(upstream) or None
