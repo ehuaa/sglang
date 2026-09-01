@@ -515,13 +515,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
+            pp_proxy_out = None
             if get_parallel().enable_dp_attention:
-                self.target_worker.forward_batch_generation(
+                idle_out = self.target_worker.forward_batch_generation(
                     batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
-            return self._decode_idle_result(on_publish=on_publish)
+                pp_proxy_out = idle_out.pp_hidden_states_proxy_tensors
+            if self._pp_enabled and not self._pp_is_last_rank:
+                assert pp_proxy_out is not None, (
+                    "non-last PP rank must relay proxy hidden downstream even "
+                    "when its DP rank is idle"
+                )
+            return self._decode_idle_result(
+                on_publish=on_publish, pp_proxy_out=pp_proxy_out
+            )
 
         batch_output = self.target_worker.forward_batch_generation(
             batch,
@@ -623,6 +632,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         *,
         on_publish,
+        pp_proxy_out=None,
     ) -> GenerationBatchResult:
         next_draft_input = make_next_draft_input(
             bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
@@ -639,6 +649,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=False,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=next_draft_input.new_seq_lens,
+            pp_hidden_states_proxy_tensors=pp_proxy_out,
         )
 
     def _draft_block_from_pp_raw(self, pp_raw, batch, sampling_info):
@@ -705,13 +716,27 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
+            pp_proxy_out = None
             if get_parallel().enable_dp_attention:
-                if self._draft_is_moe:
+                # The draft model lives only on the last PP rank.
+                if self._draft_is_moe and (
+                    not self._pp_enabled or self._pp_is_last_rank
+                ):
                     self._proposer.run_idle_participation(batch)
-                self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                idle_out = self._verify_executor.run_idle_participation(
+                    batch=batch,
+                    idle_layout=self._idle_verify_ragged_layout(batch),
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
-            return self._decode_idle_result(on_publish=on_publish)
+                pp_proxy_out = idle_out.pp_hidden_states_proxy_tensors
+            if self._pp_enabled and not self._pp_is_last_rank:
+                assert pp_proxy_out is not None, (
+                    "non-last PP rank must relay proxy hidden downstream even "
+                    "when its DP rank is idle"
+                )
+            return self._decode_idle_result(
+                on_publish=on_publish, pp_proxy_out=pp_proxy_out
+            )
 
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()

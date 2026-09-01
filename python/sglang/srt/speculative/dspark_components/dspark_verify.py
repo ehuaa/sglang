@@ -418,7 +418,8 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
-    ) -> None:
+        pp_proxy_tensors=None,
+    ) -> TargetVerifyResult:
         """Run a dummy target-verify forward so an idle DP rank joins the
         token-keyed collective ops of the busy ranks' verify step."""
         device = self.model_runner.device
@@ -457,11 +458,19 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        self.target_worker.forward_batch_generation(
+        target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        return TargetVerifyResult(
+            logits_output=target_out.logits_output,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
+            pp_hidden_states_proxy_tensors=getattr(
+                target_out, "pp_hidden_states_proxy_tensors", None
+            ),
         )
 
     def run_non_compact(
