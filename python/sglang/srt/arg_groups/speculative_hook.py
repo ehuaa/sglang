@@ -385,16 +385,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if (
-        server_args.pp_size > 1
-        and server_args.enable_dp_attention
-        and server_args.dp_size > 1
-    ):
-        raise ValueError(
-            "DSpark PP currently does not support dp-attention "
-            "(PP ranks must see an identical batch). Set --dp-size 1."
-        )
-
     if server_args.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
             declare_resolution(
