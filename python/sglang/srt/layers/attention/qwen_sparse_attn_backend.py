@@ -77,6 +77,27 @@ def _resolve_flash_attn_varlen_func():
         return flash_attn_varlen_func
     except ImportError:
         pass
+
+    # Below Blackwell the cute fallback is a dead end -- it is CuTe-DSL
+    # SM90+ -- so take sgl-kernel's varlen kernel, which covers Ampere.
+    from sglang.srt.utils import is_sm100_supported
+
+    if not is_sm100_supported():
+        try:
+            from sgl_kernel.flash_attn import (
+                flash_attn_varlen_func as sgl_varlen_func,
+                is_fa3_supported,
+            )
+
+            if is_fa3_supported():
+
+                def flash_attn_varlen_func(*args, **kwargs):
+                    output = sgl_varlen_func(*args, **kwargs)
+                    return output[0] if isinstance(output, tuple) else output
+
+                return flash_attn_varlen_func
+        except ImportError:
+            pass
     try:
         from flash_attn.cute.interface import (
             flash_attn_varlen_func as cute_varlen_func,
