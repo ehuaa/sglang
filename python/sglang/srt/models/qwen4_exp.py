@@ -714,15 +714,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
 
 
+# Table storage modes for the PLE gather kernel below. Triton can only close
+# over globals declared as tl.constexpr; the host side reads .value.
+_PLE_BF16 = tl.constexpr(0)
+_PLE_FP8_NATIVE = tl.constexpr(1)
+_PLE_FP8_LUT = tl.constexpr(2)
+
+
 @triton.jit
 def _gather_ple_embedding_from_pinned_kernel(
     weight_ptr,
     ids_ptr,
     output_ptr,
+    fp8_lut_ptr,
     embedding_dim,
     tp_vocab_start,
     tp_vocab_end,
-    is_fp8: tl.constexpr,
+    fp8_mode: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row_id = tl.program_id(0)
@@ -731,15 +739,24 @@ def _gather_ple_embedding_from_pinned_kernel(
     local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
-    if is_fp8:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    if fp8_mode == _PLE_FP8_LUT:
+        byte_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        raw = tl.load(
+            byte_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0,
+        ).to(tl.int32)
+        values = tl.load(fp8_lut_ptr + raw, mask=mask, other=0.0)
     else:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
+        if fp8_mode == _PLE_FP8_NATIVE:
+            weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        else:
+            weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
         tl.where(in_range, values, 0.0),
@@ -813,6 +830,28 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+        # Triton refuses to declare tl.float8e4nv below SM90 even for a plain
+        # load, so widen e4m3 bytes through a 256-entry bf16 table there.
+        if self.weight.dtype != torch.float8_e4m3fn:
+            self._fp8_mode = _PLE_BF16.value
+        elif torch.cuda.get_device_capability()[0] >= 9:
+            self._fp8_mode = _PLE_FP8_NATIVE.value
+        else:
+            self._fp8_mode = _PLE_FP8_LUT.value
+        self._fp8_lut_cache = None
+
+    def _fp8_lut(self, device: torch.device) -> torch.Tensor:
+        """Every e4m3 byte widened to bf16, so the gather needs no fp8 dtype."""
+        lut = self._fp8_lut_cache
+        if lut is None or lut.device != device:
+            lut = (
+                torch.arange(256, dtype=torch.uint8)
+                .view(torch.float8_e4m3fn)
+                .to(torch.bfloat16)
+                .to(device)
+            )
+            self._fp8_lut_cache = lut
+        return lut
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -850,10 +889,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 self.weight.data_ptr(),
                 flat_ids,
                 output,
+                self._fp8_lut(output.device),
                 embedding_dim=self.embedding_dim,
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                fp8_mode=self._fp8_mode,
                 BLOCK_D=self._block_d,
             )
         return output
