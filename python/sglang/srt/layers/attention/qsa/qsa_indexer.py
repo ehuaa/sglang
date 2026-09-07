@@ -332,6 +332,17 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
+            # The plan pads its tail with inert entries whose member row is 0,
+            # and every group spans `ratio` rows, so a padded entry reads rows
+            # 0..ratio-1. A forward carrying fewer than `ratio` token rows (the
+            # 1-token extend chunk that ends a request) therefore gathers past
+            # token_k. The read is usually absorbed by neighbouring allocated
+            # memory and only faults when it crosses an unmapped page, which is
+            # why it surfaces as a rare illegal access at the next sync rather
+            # than here. Padded entries write the reserved slot 0 and their
+            # values are discarded, and real entries are always in range, so
+            # clamping is exact rather than a mask over the symptom.
+            group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
                 source_rope = build_rope_position_matrix(
