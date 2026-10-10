@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -62,6 +62,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # When a string parameter value is very long (e.g. code), we stream it
         # incrementally instead of waiting for the complete </parameter> tag.
         self._streaming_param_active: bool = False
+        # The value's single leading newline is a format artifact, but it may
+        # arrive in a later chunk than the <parameter=name> header.
+        self._streaming_param_at_value_start: bool = False
+        # Whether the value's opening quote has been emitted. It is held back
+        # while the value could still be the literal `null`, which
+        # _convert_param_value turns into JSON null rather than a string.
+        self._streaming_param_opened: bool = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -190,12 +197,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         if param_name not in param_config:
             # Unknown param schema - default to streaming (treat as string)
             return True
-        p_info = param_config[param_name]
-        if isinstance(p_info, dict) and "type" in p_info:
-            p_type = str(p_info["type"]).strip().lower()
-            return p_type in ("string", "str", "text", "varchar", "char", "enum")
-        # No type info - default to streaming
-        return True
+        # Same type inference as _convert_param_value, so a schema without a
+        # top-level "type" (e.g. nullable anyOf) is not mistaken for a string.
+        p_type = self._get_param_type(param_config[param_name])
+        return p_type in ("string", "str", "text", "varchar", "char", "enum")
 
     def _find_safe_emit_end(self, text: str) -> int:
         """Find safe position up to which we can emit, avoiding partial closing tags.
@@ -225,6 +230,74 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def _reset_streaming_param(self):
         """Reset incremental parameter streaming state."""
         self._streaming_param_active = False
+        self._streaming_param_at_value_start = False
+        self._streaming_param_opened = False
+
+    def _find_param_end(self, text: str) -> Tuple[int, int]:
+        """Locate where a parameter value ends in `text`.
+
+        A value normally ends at </parameter>, but the model may omit it and go
+        straight to the next <parameter= or to </function>; those are left
+        unconsumed. Returns (end_pos, end_token_len), or (-1, 0) if none.
+        """
+        candidates = [
+            (pos, length)
+            for pos, length in (
+                (text.find(self.parameter_end_token), len(self.parameter_end_token)),
+                (text.find(self.parameter_prefix), 0),
+                (text.find(self.function_end_token), 0),
+            )
+            if pos != -1
+        ]
+        if not candidates:
+            return -1, 0
+        return min(candidates, key=lambda x: x[0])
+
+    def _continue_streaming_param(
+        self, current_slice: str, calls: List[ToolCallItem]
+    ) -> bool:
+        """Emit the next piece of a streaming string value from `current_slice`.
+
+        Returns True when the value ended (keep parsing), False when it needs
+        more text.
+        """
+        end_pos, end_token_len = self._find_param_end(current_slice)
+        if end_pos != -1:
+            tail = current_slice[:end_pos]
+            if tail.endswith("\n"):
+                tail = tail[:-1]
+            if self._streaming_param_opened:
+                fragment = json.dumps(tail, ensure_ascii=False)[1:-1] + '"'
+            elif tail.lower() == "null":
+                fragment = "null"
+            else:
+                fragment = json.dumps(tail, ensure_ascii=False)
+            calls.append(
+                ToolCallItem(tool_index=self.current_tool_id, parameters=fragment)
+            )
+            self.current_tool_param_count += 1
+            self._reset_streaming_param()
+            self.parsed_pos += end_pos + end_token_len
+            return True
+        # No end yet: emit what is unambiguous. Hold back a partial end tag and
+        # a trailing newline, which is a format artifact only when the end tag
+        # turns out to follow it.
+        safe_end = self._find_safe_emit_end(current_slice)
+        if safe_end > 0 and current_slice[safe_end - 1] == "\n":
+            safe_end -= 1
+        pending = current_slice[:safe_end]
+        if not self._streaming_param_opened and "null".startswith(pending.lower()):
+            return False
+        escaped = json.dumps(pending, ensure_ascii=False)[1:-1]
+        if not self._streaming_param_opened:
+            escaped = '"' + escaped
+            self._streaming_param_opened = True
+        if escaped:
+            calls.append(
+                ToolCallItem(tool_index=self.current_tool_id, parameters=escaped)
+            )
+        self.parsed_pos += safe_end
+        return False
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
@@ -323,40 +396,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # what just arrived, not the whole accumulated value (O(N) over the
             # parameter instead of O(N^2)).
             if self._streaming_param_active:
-                end_pos = current_slice.find(self.parameter_end_token)
-                if end_pos != -1:
-                    tail = current_slice[:end_pos]
-                    if tail.endswith("\n"):
-                        tail = tail[:-1]
-                    if tail:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                parameters=json.dumps(tail, ensure_ascii=False)[1:-1],
-                            )
-                        )
-                    calls.append(
-                        ToolCallItem(tool_index=self.current_tool_id, parameters='"')
-                    )
-                    self.current_tool_param_count += 1
-                    self._reset_streaming_param()
-                    self.parsed_pos += end_pos + len(self.parameter_end_token)
+                if self._streaming_param_at_value_start:
+                    self._streaming_param_at_value_start = False
+                    if current_slice.startswith("\n"):
+                        self.parsed_pos += 1
+                        continue
+                if self._continue_streaming_param(current_slice, calls):
                     continue
-                # No closing tag yet: emit what is unambiguous. Hold back a
-                # partial closing tag and a trailing newline, which is a format
-                # artifact only when </parameter> turns out to follow it.
-                safe_end = self._find_safe_emit_end(current_slice)
-                if safe_end > 0 and current_slice[safe_end - 1] == "\n":
-                    safe_end -= 1
-                if safe_end > 0:
-                    escaped = json.dumps(current_slice[:safe_end], ensure_ascii=False)[1:-1]
-                    if escaped:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id, parameters=escaped
-                            )
-                        )
-                    self.parsed_pos += safe_end
                 break
 
             # -------------------------------------------------------
@@ -409,25 +455,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     # 2. [Abnormal] Encounter next <parameter=
                     # 3. [Abnormal] Encounter </function>
                     # So we need to find the smallest one as the parameter end position.
-                    cand_end_param = rest_of_slice.find(self.parameter_end_token)
-                    cand_next_param = rest_of_slice.find(self.parameter_prefix)
-                    cand_end_func = rest_of_slice.find(self.function_end_token)
+                    end_pos, end_token_len = self._find_param_end(rest_of_slice)
 
-                    candidates = []
-                    if cand_end_param != -1:
-                        candidates.append(
-                            (cand_end_param, len(self.parameter_end_token))
-                        )
-                    if cand_next_param != -1:
-                        candidates.append((cand_next_param, 0))
-                    if cand_end_func != -1:
-                        candidates.append((cand_end_func, 0))
-
-                    if candidates:
-                        best_cand = min(candidates, key=lambda x: x[0])
-                        end_pos = best_cand[0]
-                        end_token_len = best_cand[1]
-
+                    if end_pos != -1:
                         param_name = current_slice[
                             len(self.parameter_prefix) : name_end
                         ]
@@ -491,7 +521,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             )
                         )
                         self.json_started = True
-                    key_prefix = f'{json.dumps(param_name)}: "'
+                    key_prefix = f"{json.dumps(param_name)}: "
                     if self.current_tool_param_count > 0:
                         key_prefix = f", {key_prefix}"
                     calls.append(
@@ -499,12 +529,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             tool_index=self.current_tool_id, parameters=key_prefix
                         )
                     )
-                    # Consume the header. The value's single leading newline is
-                    # a format artifact. From here the continuation branch above
-                    # owns this parameter.
+                    # Consume the header. From here the continuation branch
+                    # above owns this parameter, starting with dropping the
+                    # value's leading newline once its first byte arrives.
                     self.parsed_pos += value_start_idx
-                    if self._buffer[self.parsed_pos : self.parsed_pos + 1] == "\n":
-                        self.parsed_pos += 1
+                    self._streaming_param_at_value_start = True
                     continue
 
                 # Incomplete parameter tag or value

@@ -2466,6 +2466,58 @@ null
         self.assertIsInstance(params["cities"], list)
         self.assertEqual(params["cities"], ["NYC"])
 
+    def _stream_params(self, chunks):
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+        return json.loads(collected_params)
+
+    def test_streaming_leading_newline_in_next_chunk(self):
+        """
+        Scenario: The <parameter=name> header ends one chunk and the value's
+        format newline arrives in the next.
+        Purpose: Verify the newline is still dropped instead of leaking into
+        the streamed value.
+        """
+        chunks = [
+            "<tool_call>\n<function=sql_interpreter>\n<parameter=query>",
+            "\n",
+            "SELECT 1",
+            "\n",
+            "</parameter>\n</function>\n</tool_call>",
+        ]
+        self.assertEqual(self._stream_params(chunks), {"query": "SELECT 1"})
+
+    def test_streaming_matches_one_shot_char_by_char(self):
+        """
+        Scenario: Streamed string values that the one-shot parser treats
+        specially: the literal null, and a missing </parameter>.
+        Purpose: Verify char-by-char streaming yields the same arguments as
+        detect_and_parse.
+        """
+        texts = [
+            "<tool_call>\n<function=sql_interpreter>\n<parameter=query>\nnull\n"
+            "</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=sql_interpreter>\n<parameter=query>\nnullable\n"
+            "</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=sql_interpreter>\n<parameter=query>\nSELECT 1\n"
+            "<parameter=dry_run>\ntrue\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=sql_interpreter>\n<parameter=query>\nSELECT 1\n"
+            "</function>\n</tool_call>",
+        ]
+        for text in texts:
+            with self.subTest(text=text):
+                expected = json.loads(
+                    self.detector.detect_and_parse(text, self.tools)
+                    .calls[0]
+                    .parameters
+                )
+                self.assertEqual(self._stream_params(list(text)), expected)
+
     # ==================== Edge Cases ====================
 
     def test_empty_parameter_value(self):
