@@ -169,6 +169,8 @@ struct GroupedGemmaRMSNormKernel {
     };
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    // An idle DP-attention rank has no tokens, and a zero grid is an invalid launch.
+    if (num_tokens == 0) return;
     const uint32_t num_blocks = num_tokens * params.num_groups;
     LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
