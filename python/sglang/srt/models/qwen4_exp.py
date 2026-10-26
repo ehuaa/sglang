@@ -59,6 +59,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.humming import HummingConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
@@ -120,6 +121,8 @@ def _ple_table_is_fp8(
         return False
     if quant_config.get_name() == "fp8":
         return True
+    if isinstance(quant_config, HummingConfig):
+        return quant_config.full_config.get("quant_method") == "fp8"
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         return quant_config.resolve_quant_algo(prefix) == "FP8"
     return False
