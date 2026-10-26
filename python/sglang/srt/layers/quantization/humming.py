@@ -475,6 +475,9 @@ class HummingConfig(QuantizationConfig):
             else self.full_config.get("weight_block_size")
         )
         self.is_fp4_experts: bool = False
+        self.packed_modules_mapping: dict[str, list[str]] = (
+            self.full_config.get("packed_modules_mapping") or {}
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -511,6 +514,19 @@ class HummingConfig(QuantizationConfig):
         self.hf_to_sglang_mapper = hf_to_sglang_mapper
 
     def is_layer_skipped(self, config: dict[str, Any], prefix: str):
+        # Checkpoints list a fused layer (gate_up_proj) by its shards (gate_proj,
+        # up_proj), so it is skipped only when every shard is.
+        proj_name = prefix.rsplit(".", 1)[-1]
+        shard_names = self.packed_modules_mapping.get(proj_name)
+        if not shard_names:
+            return self._is_module_skipped(config, prefix)
+        module_prefix = prefix[: -len(proj_name)]
+        return all(
+            self._is_module_skipped(config, module_prefix + shard_name)
+            for shard_name in shard_names
+        )
+
+    def _is_module_skipped(self, config: dict[str, Any], prefix: str):
         keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
         ignored_layers = self.get_from_keys_or(config, keys, []) or []
         if hasattr(self, "hf_to_sglang_mapper"):
